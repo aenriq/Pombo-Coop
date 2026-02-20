@@ -14,7 +14,7 @@ impl AppShell {
             }
             ButtonKind::Primary => {
                 if selected {
-                    (colors.primary, colors.text_primary)
+                    (colors.primary, colors.primary_foreground)
                 } else {
                     (colors.text_muted, colors.primary_foreground)
                 }
@@ -36,6 +36,16 @@ impl AppShell {
         }
     }
 
+    pub(super) fn button_hover_bg(&self, kind: ButtonKind) -> u32 {
+        let colors = self.colors();
+        match kind {
+            ButtonKind::Neutral => colors.accent,
+            ButtonKind::Primary => colors.primary,
+            ButtonKind::Success => colors.success,
+            ButtonKind::Destructive => colors.destructive,
+        }
+    }
+
     pub(super) fn render_text_button<F>(
         &self,
         label: impl Into<SharedString>,
@@ -50,6 +60,7 @@ impl AppShell {
     {
         let label: SharedString = label.into();
         let (text_color, hover_text_color) = self.button_palette(kind, selected);
+        let hover_bg = self.button_hover_bg(kind);
         let text_weight = if selected {
             FontWeight::SEMIBOLD
         } else {
@@ -66,7 +77,7 @@ impl AppShell {
             .text_xs()
             .font_weight(text_weight)
             .text_color(rgb(text_color))
-            .hover(move |style| style.text_color(rgb(hover_text_color)))
+            .hover(move |style| style.bg(rgb(hover_bg)).text_color(rgb(hover_text_color)))
             .on_mouse_move(|_, window, _| window.refresh())
             .on_mouse_down(MouseButton::Left, cx.listener(on_click))
             .child(label)

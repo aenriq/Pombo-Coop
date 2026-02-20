@@ -86,7 +86,7 @@ impl AppShell {
     pub(super) fn render_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
         div()
-            .h(px(36.0))
+            .h(px(TOP_BAR_HEIGHT))
             .px_3()
             .border_b_1()
             .border_color(rgb(colors.border))
@@ -99,6 +99,7 @@ impl AppShell {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .child(div().w(px(TOP_BAR_TRAFFIC_LIGHT_SPACER)).h(px(1.0)))
                     .child(
                         div()
                             .h(px(22.0))
@@ -158,7 +159,7 @@ impl AppShell {
                             ),
                     )
                     .child(self.render_text_button(
-                        format!("Stone {}", self.theme.mode.label()),
+                        format!("Neutral {}", self.theme.mode.label()),
                         ButtonKind::Neutral,
                         ButtonSize::Regular,
                         false,

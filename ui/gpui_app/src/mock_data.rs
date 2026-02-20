@@ -331,6 +331,17 @@ impl EpicBMockData {
         &self.changed_files
     }
 
+    pub fn changed_files_for_lane(&self, lane_id: Option<u32>) -> Vec<&ChangedFile> {
+        match lane_id {
+            Some(lane_id) => self
+                .changed_files
+                .iter()
+                .filter(|file| file.owner_lane_id == Some(lane_id))
+                .collect(),
+            None => self.changed_files.iter().collect(),
+        }
+    }
+
     pub fn diff_mode(&self) -> DiffViewMode {
         self.diff_mode
     }
@@ -355,6 +366,28 @@ impl EpicBMockData {
             .position(|file| file.id == selected_file_id)
     }
 
+    fn lane_file_ids(&self, lane_id: Option<u32>) -> Vec<u32> {
+        self.changed_files_for_lane(lane_id)
+            .into_iter()
+            .map(|file| file.id)
+            .collect()
+    }
+
+    pub fn select_file_for_lane(&mut self, lane_id: Option<u32>) -> bool {
+        let lane_file_ids = self.lane_file_ids(lane_id);
+        let next_selected = if lane_file_ids.is_empty() {
+            None
+        } else {
+            self.selected_file_id
+                .filter(|selected_id| lane_file_ids.contains(selected_id))
+                .or_else(|| lane_file_ids.first().copied())
+        };
+
+        let changed = self.selected_file_id != next_selected;
+        self.selected_file_id = next_selected;
+        changed
+    }
+
     pub fn select_file_by_id(&mut self, file_id: u32) -> bool {
         if self.changed_files.iter().any(|file| file.id == file_id) {
             self.selected_file_id = Some(file_id);
@@ -364,33 +397,45 @@ impl EpicBMockData {
         }
     }
 
-    pub fn select_next_file(&mut self) -> bool {
-        if self.changed_files.is_empty() {
+    pub fn select_next_file_for_lane(&mut self, lane_id: Option<u32>) -> bool {
+        let lane_file_ids = self.lane_file_ids(lane_id);
+        if lane_file_ids.is_empty() {
             self.selected_file_id = None;
             return false;
         }
 
-        let next_index = match self.selected_file_index() {
-            Some(index) => (index + 1) % self.changed_files.len(),
+        let next_index = match self.selected_file_id {
+            Some(selected_file_id) => lane_file_ids
+                .iter()
+                .position(|file_id| *file_id == selected_file_id)
+                .map(|index| (index + 1) % lane_file_ids.len())
+                .unwrap_or(0),
             None => 0,
         };
 
-        self.selected_file_id = Some(self.changed_files[next_index].id);
+        self.selected_file_id = Some(lane_file_ids[next_index]);
         true
     }
 
-    pub fn select_previous_file(&mut self) -> bool {
-        if self.changed_files.is_empty() {
+    pub fn select_previous_file_for_lane(&mut self, lane_id: Option<u32>) -> bool {
+        let lane_file_ids = self.lane_file_ids(lane_id);
+        if lane_file_ids.is_empty() {
             self.selected_file_id = None;
             return false;
         }
 
-        let previous_index = match self.selected_file_index() {
-            Some(0) | None => self.changed_files.len() - 1,
-            Some(index) => index - 1,
+        let previous_index = match self.selected_file_id {
+            Some(selected_file_id) => match lane_file_ids
+                .iter()
+                .position(|file_id| *file_id == selected_file_id)
+            {
+                Some(0) | None => lane_file_ids.len() - 1,
+                Some(index) => index - 1,
+            },
+            None => lane_file_ids.len() - 1,
         };
 
-        self.selected_file_id = Some(self.changed_files[previous_index].id);
+        self.selected_file_id = Some(lane_file_ids[previous_index]);
         true
     }
 

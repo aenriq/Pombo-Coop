@@ -82,15 +82,22 @@ impl AppShell {
     pub(super) fn render_changed_files_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let subtitle: SharedString = format!("{:.0}px", self.right_pane_width).into();
         let controls = div();
+        let lane_files = self.data.changed_files_for_lane(self.selected_lane_id);
+        let lane_file_count = lane_files.len();
 
         let mut files = div().id("changed-files-list").flex().flex_col().gap_0p5();
-        for file in self.data.changed_files() {
+        for file in lane_files {
             files = files.child(self.render_changed_file_row(file, cx));
         }
 
         let selected_stage = self
             .data
             .selected_file()
+            .filter(|file| {
+                self.selected_lane_id
+                    .map(|lane_id| file.owner_lane_id == Some(lane_id))
+                    .unwrap_or(true)
+            })
             .map(|file| file.stage_group.label().to_string())
             .unwrap_or_else(|| "none".to_string());
 
@@ -141,7 +148,7 @@ impl AppShell {
                                             .text_color(rgb(self.colors().text_muted))
                                             .child(format!(
                                                 "{} files • selected stage {}",
-                                                self.data.changed_files().len(),
+                                                lane_file_count,
                                                 selected_stage
                                             )),
                                     )

@@ -8,7 +8,7 @@ use crate::color_system::{ThemePalette, ThemeSelection};
 use crate::mock_data::{epic_b_mock_data, DiffViewMode, EpicBMockData};
 use crate::ui_state::{PaneSizes, ReviewMode, UiState};
 use gpui::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 const DEFAULT_LEFT_PANE_WIDTH: f32 = 260.0;
 const DEFAULT_RIGHT_PANE_WIDTH: f32 = 320.0;
@@ -18,7 +18,22 @@ const MIN_MIDDLE_PANE_WIDTH: f32 = 420.0;
 const SIDE_PANE_RESIZE_STEP: f32 = 24.0;
 const SPLITTER_TRACK_WIDTH: f32 = 1.0;
 const SPLITTER_HIT_WIDTH: f32 = 8.0;
+const ACCORDION_ANIMATION_MS: u64 = 180;
+const LANE_ROW_ESTIMATED_HEIGHT: f32 = 58.0;
+const LANE_ROW_GAP: f32 = 2.0;
+const LANE_SECTION_HEIGHT_SLACK: f32 = 6.0;
+const LANE_ROW_HEIGHT_ERROR_MARGIN: f32 = 2.0;
+const TOP_BAR_HEIGHT: f32 = 40.0;
+#[cfg(target_os = "macos")]
+const TOP_BAR_TRAFFIC_LIGHT_SPACER: f32 = 72.0;
+#[cfg(not(target_os = "macos"))]
+const TOP_BAR_TRAFFIC_LIGHT_SPACER: f32 = 0.0;
 const KEY_CONTEXT: &str = "agent-manager-shell";
+const ICON_CHEVRON_DOWN: &str = "icons/lucide-chevron-down.svg";
+const ICON_CHEVRON_RIGHT: &str = "icons/lucide-chevron-right.svg";
+const ICON_FOLDER: &str = "icons/lucide-folder.svg";
+const ICON_FOLDER_OPEN: &str = "icons/lucide-folder-open.svg";
+const ICON_GIT_BRANCH: &str = "icons/lucide-git-branch.svg";
 const ICON_SQUARE_MINUS: &str = "icons/lucide-square-minus.svg";
 const ICON_SQUARE_PLUS: &str = "icons/lucide-square-plus.svg";
 const ICON_SQUARE_DOT: &str = "icons/lucide-square-dot.svg";
@@ -138,6 +153,7 @@ pub struct AppShell {
     data: EpicBMockData,
     selected_lane_id: Option<u32>,
     collapsed_repo_groups: HashSet<String>,
+    repo_group_animation_versions: HashMap<String, u64>,
     status_text: SharedString,
 }
 
@@ -148,6 +164,7 @@ impl AppShell {
         let mut right_pane_width = DEFAULT_RIGHT_PANE_WIDTH;
         let mut theme = ThemeSelection::default();
         let selected_lane_id = data.agent_lanes().first().map(|lane| lane.id);
+        data.select_file_for_lane(selected_lane_id);
         let status_text: SharedString;
 
         match UiState::load() {
@@ -173,6 +190,7 @@ impl AppShell {
             data,
             selected_lane_id,
             collapsed_repo_groups: HashSet::new(),
+            repo_group_animation_versions: HashMap::new(),
             status_text,
         }
     }
@@ -188,12 +206,13 @@ impl AppShell {
     fn toggle_theme_mode(&mut self, cx: &mut Context<Self>) {
         self.theme = self.theme.toggled_mode();
         self.persist_ui_state();
-        self.status_text = format!("Theme: stone {}", self.theme.mode.label()).into();
+        self.status_text = format!("Theme: neutral {}", self.theme.mode.label()).into();
         cx.notify();
     }
 
     fn select_lane(&mut self, lane_id: u32, cx: &mut Context<Self>) {
         self.selected_lane_id = Some(lane_id);
+        self.data.select_file_for_lane(self.selected_lane_id);
         self.active_pane = ActivePane::Left;
         self.status_text = "Selected workspace lane".into();
         cx.notify();
@@ -241,14 +260,14 @@ impl AppShell {
     }
 
     fn select_next_file(&mut self, cx: &mut Context<Self>) {
-        if self.data.select_next_file() {
+        if self.data.select_next_file_for_lane(self.selected_lane_id) {
             self.status_text = "Selected next file".into();
             cx.notify();
         }
     }
 
     fn select_previous_file(&mut self, cx: &mut Context<Self>) {
-        if self.data.select_previous_file() {
+        if self.data.select_previous_file_for_lane(self.selected_lane_id) {
             self.status_text = "Selected previous file".into();
             cx.notify();
         }
@@ -285,6 +304,7 @@ impl AppShell {
 
     fn revert_selected_file(&mut self, cx: &mut Context<Self>) {
         if self.data.revert_selected_file() {
+            self.data.select_file_for_lane(self.selected_lane_id);
             self.status_text = "Reverted selected file from mock list".into();
             cx.notify();
         }

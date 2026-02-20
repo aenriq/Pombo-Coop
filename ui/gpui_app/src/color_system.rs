@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeName {
+    #[serde(alias = "stone")]
     #[default]
-    Stone,
+    Neutral,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -48,8 +49,8 @@ impl ThemeSelection {
 
     pub fn palette(self) -> ThemePalette {
         match (self.name, self.mode) {
-            (ThemeName::Stone, ThemeMode::Light) => ThemePalette::stone_light(),
-            (ThemeName::Stone, ThemeMode::Dark) => ThemePalette::stone_dark(),
+            (ThemeName::Neutral, ThemeMode::Light) => ThemePalette::neutral_light(),
+            (ThemeName::Neutral, ThemeMode::Dark) => ThemePalette::neutral_dark(),
         }
     }
 }
@@ -84,61 +85,61 @@ pub struct ThemePalette {
 }
 
 impl ThemePalette {
-    fn stone_light() -> Self {
+    fn neutral_light() -> Self {
         Self {
             app_bg: 0xffffff,
-            panel_bg: 0xfafaf9,
-            left_panel_bg: 0xfafaf9,
-            header_bg: 0xf5f5f4,
+            panel_bg: 0xffffff,
+            left_panel_bg: 0xfafafa,
+            header_bg: 0xf5f5f5,
             card_bg: 0xffffff,
-            border: 0xe7e5e4,
-            border_strong: 0xd6d3d1,
-            text_primary: 0x1c1917,
-            text_muted: 0x78716c,
-            primary: 0x292524,
-            primary_foreground: 0xfafaf9,
-            secondary: 0xf5f5f4,
-            secondary_foreground: 0x292524,
-            muted: 0xf5f5f4,
-            accent: 0xf5f5f4,
-            accent_foreground: 0x292524,
-            muted_foreground: 0x78716c,
+            border: 0xe5e5e5,
+            border_strong: 0xd4d4d4,
+            text_primary: 0x171717,
+            text_muted: 0x737373,
+            primary: 0x171717,
+            primary_foreground: 0xfafafa,
+            secondary: 0xf5f5f5,
+            secondary_foreground: 0x171717,
+            muted: 0xf5f5f5,
+            accent: 0xf5f5f5,
+            accent_foreground: 0x171717,
+            muted_foreground: 0x737373,
             destructive: 0xdc2626,
             destructive_foreground: 0xfef2f2,
             success: 0x16a34a,
             success_foreground: 0xf0fdf4,
             warning: 0xd97706,
             warning_foreground: 0xfffbeb,
-            splitter_hover: 0xd6d3d1,
+            splitter_hover: 0xd4d4d4,
         }
     }
 
-    fn stone_dark() -> Self {
+    fn neutral_dark() -> Self {
         Self {
-            app_bg: 0x1c1917,
-            panel_bg: 0x1c1917,
-            left_panel_bg: 0x292524,
-            header_bg: 0x292524,
-            card_bg: 0x1f1b19,
-            border: 0x44403c,
-            border_strong: 0x57534e,
-            text_primary: 0xfafaf9,
-            text_muted: 0xa8a29e,
-            primary: 0xe7e5e4,
-            primary_foreground: 0x292524,
-            secondary: 0x44403c,
-            secondary_foreground: 0xfafaf9,
-            muted: 0x44403c,
-            accent: 0x44403c,
-            accent_foreground: 0xfafaf9,
-            muted_foreground: 0xa8a29e,
+            app_bg: 0x0a0a0a,
+            panel_bg: 0x0a0a0a,
+            left_panel_bg: 0x171717,
+            header_bg: 0x171717,
+            card_bg: 0x101010,
+            border: 0x262626,
+            border_strong: 0x404040,
+            text_primary: 0xf5f5f5,
+            text_muted: 0xa3a3a3,
+            primary: 0xf5f5f5,
+            primary_foreground: 0x171717,
+            secondary: 0x262626,
+            secondary_foreground: 0xf5f5f5,
+            muted: 0x262626,
+            accent: 0x262626,
+            accent_foreground: 0xf5f5f5,
+            muted_foreground: 0xa3a3a3,
             destructive: 0xef4444,
             destructive_foreground: 0xfef2f2,
             success: 0x22c55e,
             success_foreground: 0x052e16,
             warning: 0xf59e0b,
             warning_foreground: 0x451a03,
-            splitter_hover: 0x57534e,
+            splitter_hover: 0x404040,
         }
     }
 }
