@@ -1,0 +1,14 @@
+[package]
+name = "agent_manager_core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent_manager_shared = { path = "../../shared/schema" }
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+dirs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
