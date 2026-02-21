@@ -1,4 +1,5 @@
 use super::*;
+use super::tooltip::TooltipSpec;
 use crate::mock_data::{AgentLane, AgentLaneStatus};
 use std::time::Duration;
 
@@ -106,7 +107,6 @@ impl AppShell {
             .flex_shrink_0()
             .flex()
             .flex_col()
-            .overflow_hidden()
             .bg(rgb(self.colors().left_panel_bg))
             .border_1()
             .border_color(self.pane_border_color(ActivePane::Left))
@@ -118,6 +118,86 @@ impl AppShell {
                     .overflow_y_scroll()
                     .p_2()
                     .child(groups),
+            )
+            .child(self.render_agents_footer(cx))
+    }
+
+    pub(super) fn render_agents_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors();
+
+        div()
+            .id("agents-pane-footer")
+            .h(px(38.0))
+            .px_2()
+            .flex()
+            .items_center()
+            .border_t_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.header_bg))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .w_full()
+                    .gap_1()
+                    .child(
+                        div().flex_1().child(self.render_tooltip(
+                            self.render_icon_text_button(
+                                "Add project",
+                                ICON_FOLDER_PLUS,
+                                ButtonKind::Neutral,
+                                ButtonSize::Regular,
+                                false,
+                                |this, _, _, cx| {
+                                    this.active_pane = ActivePane::Left;
+                                    this.status_text = "Add project action coming soon".into();
+                                    cx.notify();
+                                },
+                                cx,
+                            ),
+                            TooltipSpec::top("add-project", "Add a project/worktree"),
+                            cx,
+                        )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_0p5()
+                            .child(self.render_tooltip(
+                                self.render_icon_button(
+                                    ICON_ARCHIVE,
+                                    ButtonKind::Neutral,
+                                    ButtonSize::Regular,
+                                    false,
+                                    |this, _, _, cx| {
+                                        this.active_pane = ActivePane::Left;
+                                        this.status_text = "Archive view action coming soon".into();
+                                        cx.notify();
+                                    },
+                                    cx,
+                                ),
+                                TooltipSpec::top("archive", "Open archived projects"),
+                                cx,
+                            ))
+                            .child(self.render_tooltip(
+                                self.render_icon_button(
+                                    ICON_SETTINGS,
+                                    ButtonKind::Neutral,
+                                    ButtonSize::Regular,
+                                    false,
+                                    |this, _, _, cx| {
+                                        this.active_pane = ActivePane::Left;
+                                        this.status_text = "Settings action coming soon".into();
+                                        cx.notify();
+                                    },
+                                    cx,
+                                ),
+                                TooltipSpec::top("settings", "Open settings"),
+                                cx,
+                            )),
+                    ),
             )
     }
 

@@ -46,6 +46,24 @@ impl AppShell {
         }
     }
 
+    fn render_button_frame(&self, size: ButtonSize, variant: ButtonVariant) -> Div {
+        let mut button = div()
+            .h(px(size.height()))
+            .rounded_sm()
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .text_xs();
+
+        button = match variant {
+            ButtonVariant::Text => button.px(px(size.horizontal_padding())),
+            ButtonVariant::Icon => button.w(px(size.height())).justify_center(),
+            ButtonVariant::IconText => button.px(px(size.horizontal_padding())).gap_1(),
+        };
+
+        button
+    }
+
     pub(super) fn render_text_button<F>(
         &self,
         label: impl Into<SharedString>,
@@ -67,19 +85,78 @@ impl AppShell {
             FontWeight::MEDIUM
         };
 
-        div()
-            .h(px(size.height()))
-            .px(px(size.horizontal_padding()))
-            .rounded_sm()
-            .flex()
-            .items_center()
-            .cursor_pointer()
-            .text_xs()
+        self.render_button_frame(size, ButtonVariant::Text)
             .font_weight(text_weight)
             .text_color(rgb(text_color))
             .hover(move |style| style.bg(rgb(hover_bg)).text_color(rgb(hover_text_color)))
             .on_mouse_move(|_, window, _| window.refresh())
             .on_mouse_down(MouseButton::Left, cx.listener(on_click))
+            .child(label)
+    }
+
+    pub(super) fn render_icon_button<F>(
+        &self,
+        icon_path: &'static str,
+        kind: ButtonKind,
+        size: ButtonSize,
+        selected: bool,
+        on_click: F,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement
+    where
+        F: Fn(&mut Self, &MouseDownEvent, &mut Window, &mut Context<Self>) + 'static,
+    {
+        let (icon_color, _) = self.button_palette(kind, selected);
+        let hover_bg = self.button_hover_bg(kind);
+        self.render_button_frame(size, ButtonVariant::Icon)
+            .text_color(rgb(icon_color))
+            .hover(move |style| style.bg(rgb(hover_bg)))
+            .on_mouse_move(|_, window, _| window.refresh())
+            .on_mouse_down(MouseButton::Left, cx.listener(on_click))
+            .child(
+                svg()
+                    .w(px(14.0))
+                    .h(px(14.0))
+                    .path(icon_path)
+                    .text_color(rgb(icon_color)),
+            )
+    }
+
+    pub(super) fn render_icon_text_button<F>(
+        &self,
+        label: impl Into<SharedString>,
+        icon_path: &'static str,
+        kind: ButtonKind,
+        size: ButtonSize,
+        selected: bool,
+        on_click: F,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement
+    where
+        F: Fn(&mut Self, &MouseDownEvent, &mut Window, &mut Context<Self>) + 'static,
+    {
+        let label: SharedString = label.into();
+        let (text_color, hover_text_color) = self.button_palette(kind, selected);
+        let hover_bg = self.button_hover_bg(kind);
+        let text_weight = if selected {
+            FontWeight::SEMIBOLD
+        } else {
+            FontWeight::MEDIUM
+        };
+
+        self.render_button_frame(size, ButtonVariant::IconText)
+            .font_weight(text_weight)
+            .text_color(rgb(text_color))
+            .hover(move |style| style.bg(rgb(hover_bg)).text_color(rgb(hover_text_color)))
+            .on_mouse_move(|_, window, _| window.refresh())
+            .on_mouse_down(MouseButton::Left, cx.listener(on_click))
+            .child(
+                svg()
+                    .w(px(14.0))
+                    .h(px(14.0))
+                    .path(icon_path)
+                    .text_color(rgb(text_color)),
+            )
             .child(label)
     }
 

@@ -19,14 +19,23 @@ impl AssetSource for EmbeddedAssets {
             "icons/lucide-chevron-right.svg" => {
                 Some(include_bytes!("../assets/icons/lucide-chevron-right.svg").as_slice())
             }
+            "icons/lucide-archive.svg" => {
+                Some(include_bytes!("../assets/icons/lucide-archive.svg").as_slice())
+            }
             "icons/lucide-folder.svg" => {
                 Some(include_bytes!("../assets/icons/lucide-folder.svg").as_slice())
             }
             "icons/lucide-folder-open.svg" => {
                 Some(include_bytes!("../assets/icons/lucide-folder-open.svg").as_slice())
             }
+            "icons/lucide-folder-plus.svg" => {
+                Some(include_bytes!("../assets/icons/lucide-folder-plus.svg").as_slice())
+            }
             "icons/lucide-git-branch.svg" => {
                 Some(include_bytes!("../assets/icons/lucide-git-branch.svg").as_slice())
+            }
+            "icons/lucide-settings.svg" => {
+                Some(include_bytes!("../assets/icons/lucide-settings.svg").as_slice())
             }
             "icons/lucide-square-minus.svg" => {
                 Some(include_bytes!("../assets/icons/lucide-square-minus.svg").as_slice())
@@ -47,9 +56,12 @@ impl AssetSource for EmbeddedAssets {
             Ok(vec![
                 "icons/lucide-chevron-down.svg".into(),
                 "icons/lucide-chevron-right.svg".into(),
+                "icons/lucide-archive.svg".into(),
                 "icons/lucide-folder.svg".into(),
                 "icons/lucide-folder-open.svg".into(),
+                "icons/lucide-folder-plus.svg".into(),
                 "icons/lucide-git-branch.svg".into(),
+                "icons/lucide-settings.svg".into(),
                 "icons/lucide-square-minus.svg".into(),
                 "icons/lucide-square-plus.svg".into(),
                 "icons/lucide-square-dot.svg".into(),

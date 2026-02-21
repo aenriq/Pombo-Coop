@@ -3,6 +3,7 @@ mod chrome;
 mod diff_panel;
 mod left_panel;
 mod right_panel;
+mod tooltip;
 
 use crate::color_system::{ThemePalette, ThemeSelection};
 use crate::mock_data::{epic_b_mock_data, DiffViewMode, EpicBMockData};
@@ -31,9 +32,12 @@ const TOP_BAR_TRAFFIC_LIGHT_SPACER: f32 = 0.0;
 const KEY_CONTEXT: &str = "agent-manager-shell";
 const ICON_CHEVRON_DOWN: &str = "icons/lucide-chevron-down.svg";
 const ICON_CHEVRON_RIGHT: &str = "icons/lucide-chevron-right.svg";
+const ICON_ARCHIVE: &str = "icons/lucide-archive.svg";
 const ICON_FOLDER: &str = "icons/lucide-folder.svg";
 const ICON_FOLDER_OPEN: &str = "icons/lucide-folder-open.svg";
+const ICON_FOLDER_PLUS: &str = "icons/lucide-folder-plus.svg";
 const ICON_GIT_BRANCH: &str = "icons/lucide-git-branch.svg";
+const ICON_SETTINGS: &str = "icons/lucide-settings.svg";
 const ICON_SQUARE_MINUS: &str = "icons/lucide-square-minus.svg";
 const ICON_SQUARE_PLUS: &str = "icons/lucide-square-plus.svg";
 const ICON_SQUARE_DOT: &str = "icons/lucide-square-dot.svg";
@@ -79,6 +83,13 @@ enum ButtonKind {
 enum ButtonSize {
     Regular,
     Compact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ButtonVariant {
+    Text,
+    Icon,
+    IconText,
 }
 
 impl ButtonSize {
@@ -152,6 +163,7 @@ pub struct AppShell {
     theme: ThemeSelection,
     data: EpicBMockData,
     selected_lane_id: Option<u32>,
+    hovered_tooltip_id: Option<SharedString>,
     collapsed_repo_groups: HashSet<String>,
     repo_group_animation_versions: HashMap<String, u64>,
     status_text: SharedString,
@@ -189,6 +201,7 @@ impl AppShell {
             theme,
             data,
             selected_lane_id,
+            hovered_tooltip_id: None,
             collapsed_repo_groups: HashSet::new(),
             repo_group_animation_versions: HashMap::new(),
             status_text,
