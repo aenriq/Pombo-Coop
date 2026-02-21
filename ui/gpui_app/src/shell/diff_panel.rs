@@ -1,10 +1,11 @@
 use super::*;
+use super::textarea::ExpandableTextAreaSpec;
 use crate::mock_data::{
     DiffHunk, DiffLineKind, DiffRows, DiffViewMode, SplitDiffCell, SplitDiffRow, UnifiedDiffLine,
 };
 
 impl AppShell {
-    pub(super) fn render_diff_viewer_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_diff_viewer_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_label = self
             .data
             .selected_file()
@@ -137,11 +138,28 @@ impl AppShell {
                     .flex()
                     .flex_col()
                     .child(body)
-                    .child(self.render_chat_panel()),
+                    .child(self.render_chat_panel(cx)),
             )
     }
 
-    pub(super) fn render_chat_panel(&self) -> impl IntoElement {
+    pub(super) fn render_chat_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut thread = div()
+            .id("middle-chat-thread")
+            .flex_1()
+            .overflow_y_scroll()
+            .track_scroll(&self.chat_thread_scroll)
+            .flex()
+            .flex_col()
+            .gap_2();
+
+        for message in &self.chat_messages {
+            thread = thread.child(self.render_chat_message(
+                message.author.clone(),
+                message.text.clone(),
+                message.outgoing,
+            ));
+        }
+
         div()
             .id("middle-chat-panel")
             .h(px(220.0))
@@ -153,95 +171,117 @@ impl AppShell {
             .flex()
             .flex_col()
             .gap_2()
-            .child(
+            .child(thread)
+            .child(self.render_expandable_text_area(
+                ExpandableTextAreaSpec::new(
+                    "middle-chat",
+                    "Ask for follow-up changes",
+                    2,
+                    8,
+                ),
                 div()
-                    .id("middle-chat-thread")
-                    .flex_1()
-                    .overflow_y_scroll()
                     .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(self.render_chat_message(
-                        "Assistant",
-                        "Perfect! Added missing imports and verified the dialog compiles cleanly.",
-                        false,
-                    ))
-                    .child(self.render_chat_message(
-                        "Reviewer",
-                        "Could we reuse command-style keyboard navigation in this dialog?",
-                        true,
-                    ))
-                    .child(self.render_chat_message(
-                        "Assistant",
-                        "Yes. I can wire list navigation with up/down + enter in the same pass.",
-                        false,
-                    )),
-            )
-            .child(
-                div()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(self.colors().border))
-                    .bg(rgb(self.colors().card_bg))
-                    .p_2()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
+                    .justify_between()
+                    .items_center()
                     .child(
                         div()
-                            .h(px(64.0))
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(rgb(self.colors().border))
-                            .bg(rgb(self.colors().panel_bg))
-                            .px_2()
-                            .py_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(self.colors().text_muted))
-                                    .child("Message agent about this diff..."),
-                            ),
+                            .flex()
+                            .items_center()
+                            .gap_0p5()
+                            .child(self.render_icon_button(
+                                ICON_SQUARE_PLUS,
+                                ButtonKind::Neutral,
+                                ButtonSize::Regular,
+                                false,
+                                |this, _, _, cx| {
+                                    this.active_pane = ActivePane::Middle;
+                                    this.status_text = "Attach context action coming soon".into();
+                                    cx.notify();
+                                },
+                                cx,
+                            ))
+                            .child(self.render_icon_button(
+                                ICON_SQUARE_DOT,
+                                ButtonKind::Neutral,
+                                ButtonSize::Regular,
+                                false,
+                                |this, _, _, cx| {
+                                    this.active_pane = ActivePane::Middle;
+                                    this.status_text = "Model picker action coming soon".into();
+                                    cx.notify();
+                                },
+                                cx,
+                            ))
+                            .child(self.render_icon_button(
+                                ICON_CHEVRON_DOWN,
+                                ButtonKind::Neutral,
+                                ButtonSize::Regular,
+                                false,
+                                |this, _, _, cx| {
+                                    this.active_pane = ActivePane::Middle;
+                                    this.status_text = "Model menu action coming soon".into();
+                                    cx.notify();
+                                },
+                                cx,
+                            ))
+                            .child(self.render_icon_button(
+                                ICON_GIT_BRANCH,
+                                ButtonKind::Neutral,
+                                ButtonSize::Regular,
+                                false,
+                                |this, _, _, cx| {
+                                    this.active_pane = ActivePane::Middle;
+                                    this.status_text = "Reasoning mode action coming soon".into();
+                                    cx.notify();
+                                },
+                                cx,
+                            ))
+                            .child(self.render_icon_button(
+                                ICON_CHEVRON_DOWN,
+                                ButtonKind::Neutral,
+                                ButtonSize::Regular,
+                                false,
+                                |this, _, _, cx| {
+                                    this.active_pane = ActivePane::Middle;
+                                    this.status_text = "Reasoning menu action coming soon".into();
+                                    cx.notify();
+                                },
+                                cx,
+                            )),
                     )
                     .child(
                         div()
                             .flex()
-                            .justify_between()
                             .items_center()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(self.render_shortcut_chip("Sonnet 4.5", "model"))
-                                    .child(self.render_shortcut_chip("Link issue", "action")),
-                            )
-                            .child(
-                                div()
-                                    .h(px(24.0))
-                                    .px_3()
-                                    .rounded_sm()
-                                    .border_1()
-                                    .border_color(rgb(self.colors().success))
-                                    .bg(rgb(self.colors().success))
-                                    .flex()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(self.colors().success_foreground))
-                                            .child("Send"),
-                                    ),
-                            ),
+                            .gap_1()
+                            .child(self.render_icon_button(
+                                ICON_MIC,
+                                ButtonKind::Neutral,
+                                ButtonSize::Regular,
+                                false,
+                                |this, _, _, cx| {
+                                    this.active_pane = ActivePane::Middle;
+                                    this.status_text = "Voice input action coming soon".into();
+                                    cx.notify();
+                                },
+                                cx,
+                            ))
+                            .child(self.render_circular_icon_button(
+                                ICON_ARROW_UP,
+                                ButtonKind::Primary,
+                                34.0,
+                                |this, _, _, cx| this.submit_composer_message(cx),
+                                cx,
+                            )),
                     ),
-            )
+                cx,
+            ))
     }
 
     pub(super) fn render_chat_message(
         &self,
-        author: &'static str,
-        text: &'static str,
+        author: SharedString,
+        text: SharedString,
         outgoing: bool,
     ) -> impl IntoElement {
         let (bubble_bg, bubble_border, author_color, text_color) = if outgoing {

@@ -122,6 +122,47 @@ impl AppShell {
             )
     }
 
+    pub(super) fn render_circular_icon_button<F>(
+        &self,
+        icon_path: &'static str,
+        kind: ButtonKind,
+        diameter: f32,
+        on_click: F,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement
+    where
+        F: Fn(&mut Self, &MouseDownEvent, &mut Window, &mut Context<Self>) + 'static,
+    {
+        let colors = self.colors();
+        let (bg, fg) = match kind {
+            ButtonKind::Neutral => (colors.secondary, colors.secondary_foreground),
+            ButtonKind::Primary => (colors.primary, colors.primary_foreground),
+            ButtonKind::Success => (colors.success, colors.success_foreground),
+            ButtonKind::Destructive => (colors.destructive, colors.destructive_foreground),
+        };
+        let hover_bg = if matches!(kind, ButtonKind::Primary) {
+            colors.border_strong
+        } else {
+            self.button_hover_bg(kind)
+        };
+        let icon_size = (diameter * 0.45).max(12.0);
+
+        div()
+            .h(px(diameter))
+            .w(px(diameter))
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .bg(rgb(bg))
+            .text_color(rgb(fg))
+            .hover(move |style| style.bg(rgb(hover_bg)))
+            .on_mouse_move(|_, window, _| window.refresh())
+            .on_mouse_down(MouseButton::Left, cx.listener(on_click))
+            .child(svg().w(px(icon_size)).h(px(icon_size)).path(icon_path))
+    }
+
     pub(super) fn render_icon_text_button<F>(
         &self,
         label: impl Into<SharedString>,

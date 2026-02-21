@@ -3,13 +3,18 @@ mod chrome;
 mod diff_panel;
 mod left_panel;
 mod right_panel;
+mod textarea;
 mod tooltip;
 
 use crate::color_system::{ThemePalette, ThemeSelection};
 use crate::mock_data::{epic_b_mock_data, DiffViewMode, EpicBMockData};
 use crate::ui_state::{PaneSizes, ReviewMode, UiState};
 use gpui::*;
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+    time::Instant,
+};
 
 const DEFAULT_LEFT_PANE_WIDTH: f32 = 260.0;
 const DEFAULT_RIGHT_PANE_WIDTH: f32 = 320.0;
@@ -30,9 +35,11 @@ const TOP_BAR_TRAFFIC_LIGHT_SPACER: f32 = 72.0;
 #[cfg(not(target_os = "macos"))]
 const TOP_BAR_TRAFFIC_LIGHT_SPACER: f32 = 0.0;
 const KEY_CONTEXT: &str = "agent-manager-shell";
+const ICON_ARROW_UP: &str = "icons/lucide-arrow-up.svg";
 const ICON_CHEVRON_DOWN: &str = "icons/lucide-chevron-down.svg";
 const ICON_CHEVRON_RIGHT: &str = "icons/lucide-chevron-right.svg";
 const ICON_ARCHIVE: &str = "icons/lucide-archive.svg";
+const ICON_MIC: &str = "icons/lucide-mic.svg";
 const ICON_FOLDER: &str = "icons/lucide-folder.svg";
 const ICON_FOLDER_OPEN: &str = "icons/lucide-folder-open.svg";
 const ICON_FOLDER_PLUS: &str = "icons/lucide-folder-plus.svg";
@@ -44,6 +51,13 @@ const ICON_SQUARE_DOT: &str = "icons/lucide-square-dot.svg";
 
 struct DraggedLeftPaneHandle;
 struct DraggedRightPaneHandle;
+
+#[derive(Debug, Clone)]
+pub(super) struct ChatMessage {
+    pub author: SharedString,
+    pub text: SharedString,
+    pub outgoing: bool,
+}
 
 actions!(
     agent_manager_ui,
@@ -164,6 +178,20 @@ pub struct AppShell {
     data: EpicBMockData,
     selected_lane_id: Option<u32>,
     hovered_tooltip_id: Option<SharedString>,
+    composer_focus_handle: FocusHandle,
+    composer_content: SharedString,
+    composer_placeholder: SharedString,
+    composer_selected_range: Range<usize>,
+    composer_marked_range: Option<Range<usize>>,
+    composer_last_bounds: Option<Bounds<Pixels>>,
+    composer_total_visual_lines: usize,
+    composer_input_scroll: ScrollHandle,
+    composer_mouse_selecting: bool,
+    composer_mouse_selection_anchor: Option<usize>,
+    composer_mouse_down_point: Option<Point<Pixels>>,
+    composer_caret_blink_started_at: Instant,
+    chat_messages: Vec<ChatMessage>,
+    chat_thread_scroll: ScrollHandle,
     collapsed_repo_groups: HashSet<String>,
     repo_group_animation_versions: HashMap<String, u64>,
     status_text: SharedString,
@@ -202,6 +230,38 @@ impl AppShell {
             data,
             selected_lane_id,
             hovered_tooltip_id: None,
+            composer_focus_handle: cx.focus_handle(),
+            composer_content: "".into(),
+            composer_placeholder: "Message agent about this diff...".into(),
+            composer_selected_range: 0..0,
+            composer_marked_range: None,
+            composer_last_bounds: None,
+            composer_total_visual_lines: 1,
+            composer_input_scroll: ScrollHandle::new(),
+            composer_mouse_selecting: false,
+            composer_mouse_selection_anchor: None,
+            composer_mouse_down_point: None,
+            composer_caret_blink_started_at: Instant::now(),
+            chat_messages: vec![
+                ChatMessage {
+                    author: "Assistant".into(),
+                    text: "Perfect! Added missing imports and verified the dialog compiles cleanly."
+                        .into(),
+                    outgoing: false,
+                },
+                ChatMessage {
+                    author: "Reviewer".into(),
+                    text: "Could we reuse command-style keyboard navigation in this dialog?".into(),
+                    outgoing: true,
+                },
+                ChatMessage {
+                    author: "Assistant".into(),
+                    text: "Yes. I can wire list navigation with up/down + enter in the same pass."
+                        .into(),
+                    outgoing: false,
+                },
+            ],
+            chat_thread_scroll: ScrollHandle::new(),
             collapsed_repo_groups: HashSet::new(),
             repo_group_animation_versions: HashMap::new(),
             status_text,
@@ -417,7 +477,13 @@ impl AppShell {
 }
 
 impl Render for AppShell {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let root_key_context = if self.composer_focus_handle.is_focused(window) {
+            "middle-chat-focused"
+        } else {
+            KEY_CONTEXT
+        };
+
         div()
             .id("app-shell")
             .size_full()
@@ -426,7 +492,7 @@ impl Render for AppShell {
             .bg(rgb(self.colors().app_bg))
             .text_color(rgb(self.colors().text_primary))
             .track_focus(&self.focus_handle)
-            .key_context(KEY_CONTEXT)
+            .key_context(root_key_context)
             .on_mouse_move(|_, window, _| window.refresh())
             .on_action(cx.listener(|this, _: &FocusLeftPane, _, cx| {
                 this.set_active_pane(ActivePane::Left, cx);
@@ -443,10 +509,16 @@ impl Render for AppShell {
             .on_action(cx.listener(|this, _: &FocusPreviousPane, _, cx| {
                 this.set_active_pane(this.active_pane.previous(), cx);
             }))
-            .on_action(cx.listener(|this, _: &SelectNextFile, _, cx| {
+            .on_action(cx.listener(|this, _: &SelectNextFile, window, cx| {
+                if this.composer_focus_handle.is_focused(window) {
+                    return;
+                }
                 this.select_next_file(cx);
             }))
-            .on_action(cx.listener(|this, _: &SelectPreviousFile, _, cx| {
+            .on_action(cx.listener(|this, _: &SelectPreviousFile, window, cx| {
+                if this.composer_focus_handle.is_focused(window) {
+                    return;
+                }
                 this.select_previous_file(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleDiffMode, _, cx| {
