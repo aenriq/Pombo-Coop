@@ -1,3 +1,10 @@
 /target
-/.DS_Store
 /.agent-manager
+
+# macOS metadata files
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
