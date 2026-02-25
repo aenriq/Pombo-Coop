@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod input;
 mod provider;
+mod theme;
 mod ui;
 
 use std::io::{self, Stdout};

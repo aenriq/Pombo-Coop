@@ -8,6 +8,11 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    if let Some(direction) = subpanel_focus_direction(&key) {
+        app.focus_subpanel(direction);
+        return;
+    }
+
     if let Some(direction) = panel_focus_direction(&key) {
         if direction > 0 {
             app.focus_next_panel();
@@ -52,8 +57,21 @@ fn panel_focus_direction(key: &KeyEvent) -> Option<i8> {
     }
 
     match key.code {
-        KeyCode::Left | KeyCode::Char('h') | KeyCode::Up | KeyCode::Char('k') => Some(-1),
-        KeyCode::Right | KeyCode::Char('l') | KeyCode::Down | KeyCode::Char('j') => Some(1),
+        KeyCode::Left | KeyCode::Char('h') => Some(-1),
+        KeyCode::Right | KeyCode::Char('l') => Some(1),
+        _ => None,
+    }
+}
+
+fn subpanel_focus_direction(key: &KeyEvent) -> Option<i8> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT)
+    {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => Some(-1),
+        KeyCode::Down | KeyCode::Char('j') => Some(1),
         _ => None,
     }
 }

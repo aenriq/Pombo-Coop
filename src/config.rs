@@ -15,6 +15,8 @@ pub struct AppConfig {
     pub active_provider: Option<String>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -27,6 +29,62 @@ pub struct ProviderConfig {
     pub api_key_env_var: Option<String>,
     #[serde(default)]
     pub preferred_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UiConfig {
+    #[serde(default)]
+    pub panel_ratios: Option<[f32; 3]>,
+    #[serde(default)]
+    pub colors: UiColorsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UiColorsConfig {
+    #[serde(default)]
+    pub panel_background: Option<String>,
+    #[serde(default)]
+    pub panel_foreground: Option<String>,
+    #[serde(default)]
+    pub border_default: Option<String>,
+    #[serde(default)]
+    pub border_focused: Option<String>,
+    #[serde(default)]
+    pub list_highlight_background: Option<String>,
+    #[serde(default)]
+    pub list_highlight_foreground: Option<String>,
+    #[serde(default)]
+    pub model_title: Option<String>,
+    #[serde(default)]
+    pub added: Option<String>,
+    #[serde(default)]
+    pub removed: Option<String>,
+    #[serde(default)]
+    pub context_label: Option<String>,
+    #[serde(default)]
+    pub summary_label: Option<String>,
+    #[serde(default)]
+    pub line_number: Option<String>,
+    #[serde(default)]
+    pub line_added_number: Option<String>,
+    #[serde(default)]
+    pub line_added_text: Option<String>,
+    #[serde(default)]
+    pub role_agent: Option<String>,
+    #[serde(default)]
+    pub role_user: Option<String>,
+    #[serde(default)]
+    pub role_system: Option<String>,
+    #[serde(default)]
+    pub edit_prefix: Option<String>,
+    #[serde(default)]
+    pub edit_path: Option<String>,
+    #[serde(default)]
+    pub muted_text: Option<String>,
+    #[serde(default)]
+    pub link: Option<String>,
+    #[serde(default)]
+    pub status_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -116,6 +174,14 @@ impl AppConfig {
             cli: cli.to_owned(),
             detected_unix_seconds,
         };
+    }
+
+    pub fn panel_ratios(&self) -> Option<[f32; 3]> {
+        self.ui.panel_ratios
+    }
+
+    pub fn set_panel_ratios(&mut self, panel_ratios: [f32; 3]) {
+        self.ui.panel_ratios = Some(panel_ratios);
     }
 }
 

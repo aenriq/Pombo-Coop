@@ -2,10 +2,12 @@ use std::process::Command;
 
 use crate::config::AppConfig;
 use crate::provider::{AuthProbe, ProviderDescriptor, ProviderRegistry};
+use crate::theme::UiColors;
 
 pub const PANEL_COUNT: usize = 3;
 pub const PANEL_RESIZE_STEP: i16 = 4;
 pub const PANEL_MIN_WIDTH_PERCENT: i16 = 16;
+pub const DEFAULT_PANEL_WIDTHS: [u16; PANEL_COUNT] = [34, 33, 33];
 
 #[cfg(target_os = "macos")]
 pub const RESIZE_MODIFIER_LABEL: &str = "Option";
@@ -30,15 +32,38 @@ pub struct Worktree {
     pub changed_files: Vec<FileChange>,
 }
 
+#[derive(Clone, Copy)]
+pub enum ChatRole {
+    Agent,
+    User,
+    System,
+}
+
+#[derive(Clone)]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    pub content: &'static str,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChatSubpanel {
+    Transcript,
+    Composer,
+}
+
 pub struct App {
     worktrees: Vec<Worktree>,
+    chat_messages: Vec<ChatMessage>,
+    chat_draft: String,
     selected_idx: usize,
     right_selected_idx: usize,
-    details_scroll: u16,
+    chat_scroll: u16,
+    chat_subpanel: ChatSubpanel,
     focused_panel: usize,
     panel_widths: [u16; PANEL_COUNT],
     should_quit: bool,
     status_message: String,
+    ui_colors: UiColors,
     providers: ProviderRegistry,
     config: AppConfig,
 }
@@ -48,6 +73,8 @@ impl App {
         let providers = ProviderRegistry::with_defaults();
         let mut config = AppConfig::load();
         let mut status_message = String::from("Press q to quit.");
+        let panel_widths = panel_widths_from_saved_ratios(config.panel_ratios())
+            .unwrap_or(DEFAULT_PANEL_WIDTHS);
 
         let active_provider = config
             .active_provider
@@ -59,6 +86,11 @@ impl App {
         if let Some(descriptor) = providers.descriptor(&active_provider) {
             config.ensure_provider(&descriptor);
         }
+
+        let ui_colors = UiColors::from_config(&config.ui.colors);
+
+        // Keep persisted split state normalized as ratios; this is common for resizable panes.
+        config.set_panel_ratios(panel_ratios_from_widths(panel_widths));
 
         if let Err(error) = config.save() {
             status_message = format!("Could not save config: {error}");
@@ -132,13 +164,34 @@ impl App {
                     ],
                 },
             ],
+            chat_messages: vec![
+                ChatMessage {
+                    role: ChatRole::System,
+                    content: "Loaded diff context for animated-orb.ts",
+                },
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "Can you fix the duplicate shockwaves assignment in this block?",
+                },
+                ChatMessage {
+                    role: ChatRole::Agent,
+                    content: "I found the duplicate line in the build() section.\nI am going to patch the repeated `shockwaves` assignment and keep the fallback behavior.",
+                },
+                ChatMessage {
+                    role: ChatRole::Agent,
+                    content: "Edit /Users/mrnugget/work/amp/cli/src/tui/widgets/animated-orb.ts",
+                },
+            ],
+            chat_draft: String::new(),
             selected_idx: 0,
             right_selected_idx: 0,
-            details_scroll: 0,
+            chat_scroll: 0,
+            chat_subpanel: ChatSubpanel::Transcript,
             focused_panel: 0,
-            panel_widths: [34, 33, 33],
+            panel_widths,
             should_quit: false,
             status_message,
+            ui_colors,
             providers,
             config,
         };
@@ -162,6 +215,13 @@ impl App {
         self.providers
             .descriptor(self.active_provider_id())
             .expect("active provider should always exist")
+    }
+
+    pub fn active_model_label(&self) -> &str {
+        self.config
+            .provider_settings(self.active_provider_id())
+            .and_then(|provider| provider.preferred_model.as_deref())
+            .unwrap_or(self.active_provider_descriptor().default_model)
     }
 
     pub fn auth_required(&self) -> bool {
@@ -289,12 +349,31 @@ impl App {
         &self.worktrees[self.selected_idx]
     }
 
+    pub fn chat_messages(&self) -> &[ChatMessage] {
+        &self.chat_messages
+    }
+
+    pub fn chat_draft(&self) -> &str {
+        &self.chat_draft
+    }
+
     pub fn right_selected_idx(&self) -> usize {
         self.right_selected_idx
     }
 
-    pub fn details_scroll(&self) -> u16 {
-        self.details_scroll
+    pub fn chat_scroll(&self) -> u16 {
+        self.chat_scroll
+    }
+
+    pub fn chat_subpanel(&self) -> ChatSubpanel {
+        self.chat_subpanel
+    }
+
+    pub fn chat_subpanel_name(&self) -> &'static str {
+        match self.chat_subpanel {
+            ChatSubpanel::Transcript => "Transcript",
+            ChatSubpanel::Composer => "Composer",
+        }
     }
 
     pub fn focused_panel(&self) -> usize {
@@ -309,10 +388,14 @@ impl App {
         &self.status_message
     }
 
+    pub fn ui_colors(&self) -> UiColors {
+        self.ui_colors
+    }
+
     pub fn focused_panel_name(&self) -> &'static str {
         match self.focused_panel {
             0 => "Worktrees",
-            1 => "Details",
+            1 => "Chat",
             2 => "Changed Files",
             _ => "Unknown",
         }
@@ -354,6 +437,27 @@ impl App {
         self.status_message = format!("Focused panel: {}.", self.focused_panel_name());
     }
 
+    pub fn focus_subpanel(&mut self, direction: i8) {
+        if direction == 0 {
+            return;
+        }
+
+        if self.focused_panel != 1 {
+            self.status_message = format!(
+                "Panel '{}' has no subpanels.",
+                self.focused_panel_name()
+            );
+            return;
+        }
+
+        self.chat_subpanel = if direction < 0 {
+            ChatSubpanel::Transcript
+        } else {
+            ChatSubpanel::Composer
+        };
+        self.status_message = format!("Chat subpanel: {}.", self.chat_subpanel_name());
+    }
+
     pub fn move_within_focused_panel(&mut self, direction: i8) {
         if direction == 0 {
             return;
@@ -368,10 +472,16 @@ impl App {
                 }
             }
             1 => {
-                if direction > 0 {
-                    self.details_scroll = self.details_scroll.saturating_add(1);
+                if self.chat_subpanel == ChatSubpanel::Transcript {
+                    if direction > 0 {
+                        self.chat_scroll = self.chat_scroll.saturating_add(1);
+                    } else {
+                        self.chat_scroll = self.chat_scroll.saturating_sub(1);
+                    }
                 } else {
-                    self.details_scroll = self.details_scroll.saturating_sub(1);
+                    self.status_message = String::from(
+                        "Composer focused. Text input is not wired yet.",
+                    );
                 }
             }
             2 => {
@@ -439,6 +549,8 @@ impl App {
             self.panel_widths[1],
             self.panel_widths[2]
         );
+
+        self.persist_panel_ratios();
     }
 
     fn active_provider_id(&self) -> &str {
@@ -449,8 +561,17 @@ impl App {
             .unwrap_or(self.providers.default_provider_id())
     }
 
+    fn persist_panel_ratios(&mut self) {
+        self.config
+            .set_panel_ratios(panel_ratios_from_widths(self.panel_widths));
+        if let Err(error) = self.config.save() {
+            self.status_message = format!("Layout resized but failed to save: {error}");
+        }
+    }
+
     fn sync_panel_state_for_selected_worktree(&mut self) {
-        self.details_scroll = 0;
+        self.chat_scroll = 0;
+        self.chat_subpanel = ChatSubpanel::Transcript;
         let changed_files_len = self.selected_worktree().changed_files.len();
         if changed_files_len == 0 {
             self.right_selected_idx = 0;
@@ -485,4 +606,44 @@ fn open_external_url(url: &str) -> std::io::Result<()> {
     Err(std::io::Error::other(
         "opening URLs is not supported on this platform",
     ))
+}
+
+fn panel_ratios_from_widths(widths: [u16; PANEL_COUNT]) -> [f32; PANEL_COUNT] {
+    let total = widths.iter().copied().map(f32::from).sum::<f32>();
+    if total <= 0.0 {
+        return [0.34, 0.33, 0.33];
+    }
+    [
+        widths[0] as f32 / total,
+        widths[1] as f32 / total,
+        widths[2] as f32 / total,
+    ]
+}
+
+fn panel_widths_from_saved_ratios(ratios: Option<[f32; PANEL_COUNT]>) -> Option<[u16; PANEL_COUNT]> {
+    let ratios = ratios?;
+    if ratios.iter().any(|ratio| !ratio.is_finite() || *ratio <= 0.0) {
+        return None;
+    }
+
+    let sum = ratios.iter().sum::<f32>();
+    if sum <= 0.0 {
+        return None;
+    }
+
+    let normalized = [ratios[0] / sum, ratios[1] / sum, ratios[2] / sum];
+    let left = (normalized[0] * 100.0).round() as i16;
+    let middle = (normalized[1] * 100.0).round() as i16;
+    let right = 100 - left - middle;
+    let widths = [left, middle, right];
+
+    if widths.iter().any(|width| *width < PANEL_MIN_WIDTH_PERCENT) {
+        return None;
+    }
+
+    Some([
+        widths[0] as u16,
+        widths[1] as u16,
+        widths[2] as u16,
+    ])
 }

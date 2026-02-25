@@ -1,5 +1,5 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
@@ -9,6 +9,7 @@ use crate::config::config_path;
 use crate::provider::AuthStrategy;
 
 pub fn render_auth_onboarding(frame: &mut Frame, app: &App, area: Rect) {
+    let colors = app.ui_colors();
     let provider = app.active_provider_descriptor();
     let strategy_label = match provider.auth_strategy {
         AuthStrategy::Link => "Link login",
@@ -31,7 +32,7 @@ pub fn render_auth_onboarding(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![Span::styled(
             provider.login_url,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(colors.link)
                 .add_modifier(Modifier::UNDERLINED),
         )]),
         Line::from("2. Complete login in the browser."),
@@ -49,11 +50,13 @@ pub fn render_auth_onboarding(frame: &mut Frame, app: &App, area: Rect) {
     let modal_area = centered_rect(74, 75, area);
     frame.render_widget(Clear, modal_area);
     let modal = Paragraph::new(onboarding_lines)
+        .style(Style::default().bg(colors.panel_background).fg(colors.panel_foreground))
         .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .title("Provider Setup")
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors.border_default)),
         );
     frame.render_widget(modal, modal_area);
 }

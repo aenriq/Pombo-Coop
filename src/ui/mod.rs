@@ -1,6 +1,7 @@
 pub mod components;
 
 use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::widgets::Clear;
 use ratatui::Frame;
 
 use crate::app::App;
@@ -18,6 +19,8 @@ fn render_dashboard(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(2)])
         .split(frame.area());
+
+    frame.render_widget(Clear, layout[0]);
 
     let widths = app.panel_widths();
     let columns = Layout::default()
