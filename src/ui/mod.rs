@@ -1,20 +1,20 @@
 pub mod components;
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::widgets::Clear;
-use ratatui::Frame;
 
 use crate::app::App;
 
-pub fn render(frame: &mut Frame, app: &App) {
+pub fn render(frame: &mut Frame, app: &App, show_caret: bool) {
     if app.auth_required() {
         render_auth_view(frame, app);
     } else {
-        render_dashboard(frame, app);
+        render_dashboard(frame, app, show_caret);
     }
 }
 
-fn render_dashboard(frame: &mut Frame, app: &App) {
+fn render_dashboard(frame: &mut Frame, app: &App, show_caret: bool) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(2)])
@@ -22,7 +22,7 @@ fn render_dashboard(frame: &mut Frame, app: &App) {
 
     frame.render_widget(Clear, layout[0]);
 
-    let widths = app.panel_widths();
+    let widths = app.effective_panel_widths(layout[0].width);
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -33,7 +33,13 @@ fn render_dashboard(frame: &mut Frame, app: &App) {
         .split(layout[0]);
 
     components::panels::render_left_panel(frame, app, columns[0], app.focused_panel() == 0);
-    components::panels::render_middle_panel(frame, app, columns[1], app.focused_panel() == 1);
+    components::panels::render_middle_panel(
+        frame,
+        app,
+        columns[1],
+        app.focused_panel() == 1,
+        show_caret,
+    );
     components::panels::render_right_panel(frame, app, columns[2], app.focused_panel() == 2);
     components::status_bar::render_status_bar(frame, app, layout[1]);
 }

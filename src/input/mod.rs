@@ -1,10 +1,27 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
-use crate::app::App;
+use crate::app::{App, ChatSubpanel};
 
 pub fn handle_key_event(app: &mut App, key: KeyEvent) {
     if app.auth_required() {
         handle_auth_key_event(app, key);
+        return;
+    }
+
+    if app.handle_composer_key(key) {
+        return;
+    }
+
+    if handle_right_search_shortcut(app, key) {
+        return;
+    }
+
+    if app.handle_right_search_key(key) {
+        return;
+    }
+
+    if handle_right_search_clear_shortcut(app, key) {
         return;
     }
 
@@ -24,6 +41,10 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) {
 
     if let Some(direction) = panel_resize_direction(&key) {
         app.resize_focused_panel(direction);
+        return;
+    }
+
+    if handle_stage_shortcuts(app, key) {
         return;
     }
 
@@ -51,8 +72,7 @@ fn handle_auth_key_event(app: &mut App, key: KeyEvent) {
 }
 
 fn panel_focus_direction(key: &KeyEvent) -> Option<i8> {
-    if !key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT)
-    {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
         return None;
     }
 
@@ -64,8 +84,7 @@ fn panel_focus_direction(key: &KeyEvent) -> Option<i8> {
 }
 
 fn subpanel_focus_direction(key: &KeyEvent) -> Option<i8> {
-    if !key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT)
-    {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
         return None;
     }
 
@@ -118,4 +137,228 @@ fn panel_move_direction(key: &KeyEvent) -> Option<i8> {
         KeyCode::Up | KeyCode::Char('k') => Some(-1),
         _ => None,
     }
+}
+
+fn handle_stage_shortcuts(app: &mut App, key: KeyEvent) -> bool {
+    if app.focused_panel() != 2 {
+        return false;
+    }
+
+    if app.right_search_active() {
+        return false;
+    }
+
+    if !key.modifiers.is_empty() {
+        return false;
+    }
+
+    match key.code {
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            app.stage_selected_changed_file();
+            true
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            app.unstage_selected_changed_file();
+            true
+        }
+        _ => false,
+    }
+}
+
+fn handle_right_search_shortcut(app: &mut App, key: KeyEvent) -> bool {
+    if app.focused_panel() != 2 || app.right_search_active() {
+        return false;
+    }
+
+    if !key.modifiers.is_empty() {
+        return false;
+    }
+
+    if key.code == KeyCode::Char('/') {
+        app.open_right_search();
+        return true;
+    }
+
+    false
+}
+
+fn handle_right_search_clear_shortcut(app: &mut App, key: KeyEvent) -> bool {
+    if app.focused_panel() != 2 || app.right_search_active() || !app.right_search_has_query() {
+        return false;
+    }
+
+    if !key.modifiers.is_empty() {
+        return false;
+    }
+
+    if matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
+        app.clear_right_search();
+        return true;
+    }
+
+    false
+}
+
+pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent, terminal_area: Rect) -> bool {
+    if app.auth_required() {
+        return false;
+    }
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(terminal_area);
+    let widths = app.effective_panel_widths(layout[0].width);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(widths[0]),
+            Constraint::Percentage(widths[1]),
+            Constraint::Percentage(widths[2]),
+        ])
+        .split(layout[0]);
+    let Some(panel_idx) = columns
+        .iter()
+        .position(|area| point_in_rect(*area, mouse.column, mouse.row))
+    else {
+        return false;
+    };
+
+    match mouse.kind {
+        MouseEventKind::Down(_) => {
+            let was_focused = app.focused_panel();
+            app.focus_panel_by_index(panel_idx);
+            let mut changed = was_focused != panel_idx;
+            if panel_idx == 1 {
+                changed |= focus_chat_subpanel_at_mouse_row(app, columns[1], mouse.row);
+            }
+            if panel_idx == 2 {
+                changed |= select_changed_file_at_mouse_row(app, columns[2], mouse.row, true);
+            }
+            changed
+        }
+        MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+            if panel_idx != 2 {
+                return false;
+            }
+
+            select_changed_file_at_mouse_row(app, columns[2], mouse.row, false)
+        }
+        MouseEventKind::ScrollUp => {
+            if panel_idx != 2 {
+                return false;
+            }
+
+            let was_focused = app.focused_panel();
+            app.focus_panel_by_index(2);
+            app.move_within_focused_panel(-1);
+            was_focused != 2 || !app.selected_worktree().changed_files.is_empty()
+        }
+        MouseEventKind::ScrollDown => {
+            if panel_idx != 2 {
+                return false;
+            }
+
+            let was_focused = app.focused_panel();
+            app.focus_panel_by_index(2);
+            app.move_within_focused_panel(1);
+            was_focused != 2 || !app.selected_worktree().changed_files.is_empty()
+        }
+        _ => false,
+    }
+}
+
+fn select_changed_file_at_mouse_row(
+    app: &mut App,
+    right_panel: Rect,
+    mouse_row: u16,
+    force_focus: bool,
+) -> bool {
+    if right_panel.width < 3 || right_panel.height < 3 {
+        return false;
+    }
+
+    let mut content_area = Rect {
+        x: right_panel.x.saturating_add(1),
+        y: right_panel.y.saturating_add(1),
+        width: right_panel.width.saturating_sub(2),
+        height: right_panel.height.saturating_sub(2),
+    };
+    if app.focused_panel() == 2 {
+        let footer_height = if app.right_search_visible() { 3 } else { 2 };
+        if content_area.height > footer_height {
+            content_area.height = content_area.height.saturating_sub(footer_height);
+        }
+    }
+
+    if mouse_row < content_area.y || mouse_row >= content_area.y.saturating_add(content_area.height)
+    {
+        return false;
+    }
+
+    let row = mouse_row.saturating_sub(content_area.y) as usize;
+    let mut changed = false;
+    if let Some(file_idx) = app.changed_file_index_for_list_row(row) {
+        if force_focus {
+            let was_focused = app.focused_panel();
+            app.focus_panel_by_index(2);
+            changed |= was_focused != 2;
+        }
+        changed |= app.select_right_file(file_idx);
+    }
+    changed
+}
+
+fn focus_chat_subpanel_at_mouse_row(app: &mut App, middle_panel: Rect, mouse_row: u16) -> bool {
+    let Some(target) = chat_subpanel_at_row(middle_panel, mouse_row) else {
+        return false;
+    };
+
+    if app.chat_subpanel() == target {
+        return false;
+    }
+
+    let direction = match target {
+        ChatSubpanel::Transcript => -1,
+        ChatSubpanel::Composer => 1,
+    };
+    app.focus_subpanel(direction);
+    true
+}
+
+fn chat_subpanel_at_row(middle_panel: Rect, mouse_row: u16) -> Option<ChatSubpanel> {
+    if middle_panel.width < 3 || middle_panel.height < 3 {
+        return None;
+    }
+
+    let inner = Rect {
+        x: middle_panel.x.saturating_add(1),
+        y: middle_panel.y.saturating_add(1),
+        width: middle_panel.width.saturating_sub(2),
+        height: middle_panel.height.saturating_sub(2),
+    };
+    if mouse_row < inner.y || mouse_row >= inner.y.saturating_add(inner.height) {
+        return None;
+    }
+
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(7)])
+        .split(inner);
+
+    if mouse_row >= split[1].y && mouse_row < split[1].y.saturating_add(split[1].height) {
+        return Some(ChatSubpanel::Composer);
+    }
+    if mouse_row >= split[0].y && mouse_row < split[0].y.saturating_add(split[0].height) {
+        return Some(ChatSubpanel::Transcript);
+    }
+
+    None
+}
+
+fn point_in_rect(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.x
+        && x < area.x.saturating_add(area.width)
+        && y >= area.y
+        && y < area.y.saturating_add(area.height)
 }

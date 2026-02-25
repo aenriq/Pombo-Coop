@@ -31,28 +31,28 @@ pub struct UiColors {
 impl Default for UiColors {
     fn default() -> Self {
         Self {
-            panel_background: Color::Black,
-            panel_foreground: Color::White,
-            border_default: Color::White,
-            border_focused: Color::Cyan,
-            list_highlight_background: Color::DarkGray,
-            list_highlight_foreground: Color::White,
-            model_title: Color::LightYellow,
-            added: Color::LightGreen,
-            removed: Color::LightRed,
-            context_label: Color::Blue,
-            summary_label: Color::DarkGray,
-            line_number: Color::DarkGray,
-            line_added_number: Color::LightYellow,
-            line_added_text: Color::LightCyan,
-            role_agent: Color::LightGreen,
-            role_user: Color::LightCyan,
-            role_system: Color::LightYellow,
-            edit_prefix: Color::LightYellow,
-            edit_path: Color::LightBlue,
-            muted_text: Color::DarkGray,
-            link: Color::LightCyan,
-            status_text: Color::DarkGray,
+            panel_background: Color::Indexed(234),
+            panel_foreground: Color::Indexed(252),
+            border_default: Color::Indexed(240),
+            border_focused: Color::Indexed(44),
+            list_highlight_background: Color::Indexed(238),
+            list_highlight_foreground: Color::Indexed(255),
+            model_title: Color::Indexed(180),
+            added: Color::Indexed(78),
+            removed: Color::Indexed(203),
+            context_label: Color::Indexed(75),
+            summary_label: Color::Indexed(245),
+            line_number: Color::Indexed(243),
+            line_added_number: Color::Indexed(180),
+            line_added_text: Color::Indexed(110),
+            role_agent: Color::Indexed(114),
+            role_user: Color::Indexed(81),
+            role_system: Color::Indexed(180),
+            edit_prefix: Color::Indexed(180),
+            edit_path: Color::Indexed(75),
+            muted_text: Color::Indexed(245),
+            link: Color::Indexed(117),
+            status_text: Color::Indexed(245),
         }
     }
 }
@@ -79,11 +79,15 @@ impl UiColors {
         colors.model_title = override_color(colors.model_title, config.model_title.as_deref());
         colors.added = override_color(colors.added, config.added.as_deref());
         colors.removed = override_color(colors.removed, config.removed.as_deref());
-        colors.context_label = override_color(colors.context_label, config.context_label.as_deref());
-        colors.summary_label = override_color(colors.summary_label, config.summary_label.as_deref());
+        colors.context_label =
+            override_color(colors.context_label, config.context_label.as_deref());
+        colors.summary_label =
+            override_color(colors.summary_label, config.summary_label.as_deref());
         colors.line_number = override_color(colors.line_number, config.line_number.as_deref());
-        colors.line_added_number =
-            override_color(colors.line_added_number, config.line_added_number.as_deref());
+        colors.line_added_number = override_color(
+            colors.line_added_number,
+            config.line_added_number.as_deref(),
+        );
         colors.line_added_text =
             override_color(colors.line_added_text, config.line_added_text.as_deref());
         colors.role_agent = override_color(colors.role_agent, config.role_agent.as_deref());

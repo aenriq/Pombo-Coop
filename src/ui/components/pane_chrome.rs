@@ -9,11 +9,7 @@ pub struct PaneChrome {
 }
 
 impl PaneChrome {
-    pub fn new(
-        focused: bool,
-        focused_border_style: Style,
-        unfocused_border_style: Style,
-    ) -> Self {
+    pub fn new(focused: bool, focused_border_style: Style, unfocused_border_style: Style) -> Self {
         Self {
             focused,
             focused_border_style,

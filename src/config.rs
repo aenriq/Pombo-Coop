@@ -36,7 +36,35 @@ pub struct UiConfig {
     #[serde(default)]
     pub panel_ratios: Option<[f32; 3]>,
     #[serde(default)]
+    pub panel_focus_expand: PanelFocusExpandConfig,
+    #[serde(default)]
     pub colors: UiColorsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PanelFocusExpandConfig {
+    #[serde(default)]
+    pub mode: PanelFocusExpandMode,
+    #[serde(default = "default_panel_focus_breakpoint_cols")]
+    pub breakpoint_cols: u16,
+}
+
+impl Default for PanelFocusExpandConfig {
+    fn default() -> Self {
+        Self {
+            mode: PanelFocusExpandMode::Auto,
+            breakpoint_cols: default_panel_focus_breakpoint_cols(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PanelFocusExpandMode {
+    Off,
+    On,
+    #[default]
+    Auto,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -92,12 +120,16 @@ pub struct UiColorsConfig {
 pub enum ProviderAuth {
     #[default]
     NotAuthenticated,
-    LinkCompleted { completed_unix_seconds: u64 },
+    LinkCompleted {
+        completed_unix_seconds: u64,
+    },
     CliDetected {
         cli: String,
         detected_unix_seconds: u64,
     },
-    ApiKeyConfigured { env_var: String },
+    ApiKeyConfigured {
+        env_var: String,
+    },
 }
 
 impl ProviderAuth {
@@ -153,10 +185,7 @@ impl AppConfig {
         let completed_unix_seconds = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs());
-        let provider = self
-            .providers
-            .entry(provider_id.to_owned())
-            .or_default();
+        let provider = self.providers.entry(provider_id.to_owned()).or_default();
         provider.auth = ProviderAuth::LinkCompleted {
             completed_unix_seconds,
         };
@@ -166,10 +195,7 @@ impl AppConfig {
         let detected_unix_seconds = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs());
-        let provider = self
-            .providers
-            .entry(provider_id.to_owned())
-            .or_default();
+        let provider = self.providers.entry(provider_id.to_owned()).or_default();
         provider.auth = ProviderAuth::CliDetected {
             cli: cli.to_owned(),
             detected_unix_seconds,
@@ -200,4 +226,8 @@ pub fn config_path() -> PathBuf {
     }
 
     PathBuf::from(".agent-manager").join("config.toml")
+}
+
+fn default_panel_focus_breakpoint_cols() -> u16 {
+    140
 }

@@ -1,6 +1,8 @@
 use std::process::Command;
 
-use crate::config::AppConfig;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::config::{AppConfig, PanelFocusExpandMode};
 use crate::provider::{AuthProbe, ProviderDescriptor, ProviderRegistry};
 use crate::theme::UiColors;
 
@@ -8,17 +10,44 @@ pub const PANEL_COUNT: usize = 3;
 pub const PANEL_RESIZE_STEP: i16 = 4;
 pub const PANEL_MIN_WIDTH_PERCENT: i16 = 16;
 pub const DEFAULT_PANEL_WIDTHS: [u16; PANEL_COUNT] = [34, 33, 33];
-
-#[cfg(target_os = "macos")]
-pub const RESIZE_MODIFIER_LABEL: &str = "Option";
-#[cfg(not(target_os = "macos"))]
-pub const RESIZE_MODIFIER_LABEL: &str = "Alt";
+pub const PANEL_EXPANDED_FOCUS_WIDTHS: [u16; PANEL_COUNT] = [68, 16, 16];
 
 #[derive(Clone)]
 pub struct FileChange {
     pub path: &'static str,
     pub additions: u16,
     pub deletions: u16,
+    pub kind: FileChangeKind,
+    pub staged: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FileChangeKind {
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Copied,
+    TypeChanged,
+    Unmerged,
+    Untracked,
+    Ignored,
+}
+
+impl FileChangeKind {
+    pub fn code(self) -> char {
+        match self {
+            Self::Modified => 'M',
+            Self::Added => 'A',
+            Self::Deleted => 'D',
+            Self::Renamed => 'R',
+            Self::Copied => 'C',
+            Self::TypeChanged => 'T',
+            Self::Unmerged => '!',
+            Self::Untracked => 'U',
+            Self::Ignored => 'I',
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -42,7 +71,7 @@ pub enum ChatRole {
 #[derive(Clone)]
 pub struct ChatMessage {
     pub role: ChatRole,
-    pub content: &'static str,
+    pub content: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -55,6 +84,10 @@ pub struct App {
     worktrees: Vec<Worktree>,
     chat_messages: Vec<ChatMessage>,
     chat_draft: String,
+    chat_cursor: usize,
+    chat_preferred_column: Option<usize>,
+    right_search_active: bool,
+    right_search_query: String,
     selected_idx: usize,
     right_selected_idx: usize,
     chat_scroll: u16,
@@ -73,8 +106,8 @@ impl App {
         let providers = ProviderRegistry::with_defaults();
         let mut config = AppConfig::load();
         let mut status_message = String::from("Press q to quit.");
-        let panel_widths = panel_widths_from_saved_ratios(config.panel_ratios())
-            .unwrap_or(DEFAULT_PANEL_WIDTHS);
+        let panel_widths =
+            panel_widths_from_saved_ratios(config.panel_ratios()).unwrap_or(DEFAULT_PANEL_WIDTHS);
 
         let active_provider = config
             .active_provider
@@ -110,11 +143,64 @@ impl App {
                             path: "src/shell/planner.rs",
                             additions: 24,
                             deletions: 9,
+                            kind: FileChangeKind::Modified,
+                            staged: false,
                         },
                         FileChange {
                             path: "src/shell/events.rs",
                             additions: 6,
                             deletions: 2,
+                            kind: FileChangeKind::Untracked,
+                            staged: false,
+                        },
+                        FileChange {
+                            path: "src/shell/new_pane.rs",
+                            additions: 31,
+                            deletions: 0,
+                            kind: FileChangeKind::Added,
+                            staged: false,
+                        },
+                        FileChange {
+                            path: "src/shell/legacy_layout.rs",
+                            additions: 0,
+                            deletions: 64,
+                            kind: FileChangeKind::Deleted,
+                            staged: false,
+                        },
+                        FileChange {
+                            path: "src/shell/tree_row.rs -> src/shell/worktree_row.rs",
+                            additions: 14,
+                            deletions: 12,
+                            kind: FileChangeKind::Renamed,
+                            staged: true,
+                        },
+                        FileChange {
+                            path: "src/shell/worktree_row_copy.rs",
+                            additions: 18,
+                            deletions: 0,
+                            kind: FileChangeKind::Copied,
+                            staged: false,
+                        },
+                        FileChange {
+                            path: "assets/icon.svg",
+                            additions: 5,
+                            deletions: 3,
+                            kind: FileChangeKind::TypeChanged,
+                            staged: false,
+                        },
+                        FileChange {
+                            path: "src/shell/merge_state.rs",
+                            additions: 42,
+                            deletions: 16,
+                            kind: FileChangeKind::Unmerged,
+                            staged: false,
+                        },
+                        FileChange {
+                            path: ".cache/build-index.json",
+                            additions: 0,
+                            deletions: 0,
+                            kind: FileChangeKind::Ignored,
+                            staged: false,
                         },
                     ],
                 },
@@ -130,16 +216,22 @@ impl App {
                             path: "src/diff/parser.rs",
                             additions: 98,
                             deletions: 12,
+                            kind: FileChangeKind::Unmerged,
+                            staged: false,
                         },
                         FileChange {
                             path: "src/diff/ui.rs",
                             additions: 53,
                             deletions: 2,
+                            kind: FileChangeKind::Renamed,
+                            staged: false,
                         },
                         FileChange {
                             path: "src/shell/right_panel.rs",
                             additions: 32,
                             deletions: 0,
+                            kind: FileChangeKind::Added,
+                            staged: true,
                         },
                     ],
                 },
@@ -155,11 +247,15 @@ impl App {
                             path: "src/shell/textarea.rs",
                             additions: 0,
                             deletions: 73,
+                            kind: FileChangeKind::Deleted,
+                            staged: false,
                         },
                         FileChange {
                             path: "src/shell/diff_panel.rs",
                             additions: 8,
                             deletions: 4,
+                            kind: FileChangeKind::Modified,
+                            staged: false,
                         },
                     ],
                 },
@@ -167,22 +263,30 @@ impl App {
             chat_messages: vec![
                 ChatMessage {
                     role: ChatRole::System,
-                    content: "Loaded diff context for animated-orb.ts",
+                    content: "Loaded diff context for animated-orb.ts".to_owned(),
                 },
                 ChatMessage {
                     role: ChatRole::User,
-                    content: "Can you fix the duplicate shockwaves assignment in this block?",
+                    content:
+                        "Can you fix the duplicate shockwaves assignment in this block?"
+                            .to_owned(),
                 },
                 ChatMessage {
                     role: ChatRole::Agent,
-                    content: "I found the duplicate line in the build() section.\nI am going to patch the repeated `shockwaves` assignment and keep the fallback behavior.",
+                    content: "I found the duplicate line in the build() section.\nI am going to patch the repeated `shockwaves` assignment and keep the fallback behavior.".to_owned(),
                 },
                 ChatMessage {
                     role: ChatRole::Agent,
-                    content: "Edit /Users/mrnugget/work/amp/cli/src/tui/widgets/animated-orb.ts",
+                    content:
+                        "Edit /Users/mrnugget/work/amp/cli/src/tui/widgets/animated-orb.ts"
+                            .to_owned(),
                 },
             ],
             chat_draft: String::new(),
+            chat_cursor: 0,
+            chat_preferred_column: None,
+            right_search_active: false,
+            right_search_query: String::new(),
             selected_idx: 0,
             right_selected_idx: 0,
             chat_scroll: 0,
@@ -320,7 +424,10 @@ impl App {
         }
 
         if self.auth_required() && !self.refresh_auth_from_local_cli(false) {
-            self.status_message = format!("Switched provider to {}. Sign-in required.", next.display_name);
+            self.status_message = format!(
+                "Switched provider to {}. Sign-in required.",
+                next.display_name
+            );
         }
     }
 
@@ -349,6 +456,194 @@ impl App {
         &self.worktrees[self.selected_idx]
     }
 
+    pub fn right_search_active(&self) -> bool {
+        self.right_search_active
+    }
+
+    pub fn right_search_has_query(&self) -> bool {
+        !self.right_search_query.trim().is_empty()
+    }
+
+    pub fn right_search_visible(&self) -> bool {
+        self.right_search_active || self.right_search_has_query()
+    }
+
+    pub fn right_search_query(&self) -> &str {
+        &self.right_search_query
+    }
+
+    pub fn open_right_search(&mut self) {
+        self.focus_panel_by_index(2);
+        self.right_search_active = true;
+        self.status_message =
+            String::from("Search changed files by path (supports globs like *.rs, **/src/**).");
+        self.ensure_right_selection_valid();
+    }
+
+    pub fn handle_right_search_key(&mut self, key: KeyEvent) -> bool {
+        if !self.right_search_active || self.focused_panel != 2 {
+            return false;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT)
+            || key.modifiers.contains(KeyModifiers::SUPER)
+        {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.right_search_active = false;
+                if self.right_search_has_query() {
+                    self.status_message =
+                        String::from("Search closed. Filter is still applied (press C to clear).");
+                } else {
+                    self.status_message = String::from("Search closed.");
+                }
+                self.ensure_right_selection_valid();
+                true
+            }
+            KeyCode::Enter => {
+                self.right_search_active = false;
+                self.status_message = String::from("Changed files search applied.");
+                self.ensure_right_selection_valid();
+                true
+            }
+            KeyCode::Backspace => {
+                self.right_search_query.pop();
+                self.ensure_right_selection_valid();
+                true
+            }
+            KeyCode::Char(ch) => {
+                self.right_search_query.push(ch);
+                self.ensure_right_selection_valid();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn clear_right_search(&mut self) {
+        self.right_search_query.clear();
+        self.right_search_active = false;
+        self.status_message = String::from("Changed files search cleared.");
+        self.ensure_right_selection_valid();
+    }
+
+    pub fn select_right_file(&mut self, file_idx: usize) -> bool {
+        if file_idx >= self.selected_worktree().changed_files.len() {
+            return false;
+        }
+
+        if self.right_selected_idx == file_idx {
+            return false;
+        }
+
+        self.right_selected_idx = file_idx;
+        true
+    }
+
+    pub fn changed_file_index_for_list_row(&self, row: usize) -> Option<usize> {
+        let (unstaged, staged) = self.changed_file_sections();
+        let mut current_row = 0usize;
+
+        if self.right_search_has_query() {
+            current_row += 1; // Query summary row
+        }
+
+        current_row += 1; // Unstaged header
+        for idx in &unstaged {
+            if row == current_row {
+                return Some(*idx);
+            }
+            current_row += 1;
+        }
+        if unstaged.is_empty() {
+            current_row += 1; // "(none)" row
+        }
+
+        current_row += 1; // Staged header
+        for idx in &staged {
+            if row == current_row {
+                return Some(*idx);
+            }
+            current_row += 1;
+        }
+
+        None
+    }
+
+    pub fn stage_selected_changed_file(&mut self) {
+        if self.focused_panel != 2 {
+            self.status_message = String::from("Focus Changed Files to stage files.");
+            return;
+        }
+
+        let visible = self.right_panel_display_order();
+        if visible.is_empty() {
+            self.status_message = String::from("No files match current filter.");
+            return;
+        }
+        if !visible.contains(&self.right_selected_idx) {
+            self.right_selected_idx = visible[0];
+        }
+
+        let selected_idx = self.selected_idx;
+        let file_idx = self.right_selected_idx;
+        let Some(file) = self
+            .worktrees
+            .get_mut(selected_idx)
+            .and_then(|worktree| worktree.changed_files.get_mut(file_idx))
+        else {
+            return;
+        };
+
+        if file.staged {
+            self.status_message = format!("'{}' is already staged.", file.path);
+            return;
+        }
+
+        file.staged = true;
+        self.status_message = format!("Staged '{}'.", file.path);
+        self.ensure_right_selection_valid();
+    }
+
+    pub fn unstage_selected_changed_file(&mut self) {
+        if self.focused_panel != 2 {
+            self.status_message = String::from("Focus Changed Files to unstage files.");
+            return;
+        }
+
+        let visible = self.right_panel_display_order();
+        if visible.is_empty() {
+            self.status_message = String::from("No files match current filter.");
+            return;
+        }
+        if !visible.contains(&self.right_selected_idx) {
+            self.right_selected_idx = visible[0];
+        }
+
+        let selected_idx = self.selected_idx;
+        let file_idx = self.right_selected_idx;
+        let Some(file) = self
+            .worktrees
+            .get_mut(selected_idx)
+            .and_then(|worktree| worktree.changed_files.get_mut(file_idx))
+        else {
+            return;
+        };
+
+        if !file.staged {
+            self.status_message = format!("'{}' is not staged.", file.path);
+            return;
+        }
+
+        file.staged = false;
+        self.status_message = format!("Unstaged '{}'.", file.path);
+        self.ensure_right_selection_valid();
+    }
+
     pub fn chat_messages(&self) -> &[ChatMessage] {
         &self.chat_messages
     }
@@ -369,6 +664,14 @@ impl App {
         self.chat_subpanel
     }
 
+    pub fn composer_is_focused(&self) -> bool {
+        self.focused_panel == 1 && self.chat_subpanel == ChatSubpanel::Composer
+    }
+
+    pub fn chat_cursor_line_column(&self) -> (usize, usize) {
+        self.cursor_line_column()
+    }
+
     pub fn chat_subpanel_name(&self) -> &'static str {
         match self.chat_subpanel {
             ChatSubpanel::Transcript => "Transcript",
@@ -380,8 +683,27 @@ impl App {
         self.focused_panel
     }
 
-    pub fn panel_widths(&self) -> [u16; PANEL_COUNT] {
-        self.panel_widths
+    pub fn effective_panel_widths(&self, terminal_width: u16) -> [u16; PANEL_COUNT] {
+        if !self.should_expand_focused_panel(terminal_width) {
+            return self.panel_widths;
+        }
+
+        let mut widths = [PANEL_EXPANDED_FOCUS_WIDTHS[1]; PANEL_COUNT];
+        widths[self.focused_panel] = PANEL_EXPANDED_FOCUS_WIDTHS[0];
+        widths
+    }
+
+    pub fn panel_focus_expand_mode_summary(&self, terminal_width: u16) -> String {
+        let config = &self.config.ui.panel_focus_expand;
+        let enabled = self.should_expand_focused_panel(terminal_width);
+        match config.mode {
+            PanelFocusExpandMode::Off => String::from("off"),
+            PanelFocusExpandMode::On => String::from("on"),
+            PanelFocusExpandMode::Auto => {
+                let state = if enabled { "on" } else { "off" };
+                format!("auto<= {} ({state})", config.breakpoint_cols)
+            }
+        }
     }
 
     pub fn status_message(&self) -> &str {
@@ -437,16 +759,23 @@ impl App {
         self.status_message = format!("Focused panel: {}.", self.focused_panel_name());
     }
 
+    pub fn focus_panel_by_index(&mut self, panel: usize) {
+        if panel >= PANEL_COUNT || self.focused_panel == panel {
+            return;
+        }
+
+        self.focused_panel = panel;
+        self.status_message = format!("Focused panel: {}.", self.focused_panel_name());
+    }
+
     pub fn focus_subpanel(&mut self, direction: i8) {
         if direction == 0 {
             return;
         }
 
         if self.focused_panel != 1 {
-            self.status_message = format!(
-                "Panel '{}' has no subpanels.",
-                self.focused_panel_name()
-            );
+            self.status_message =
+                format!("Panel '{}' has no subpanels.", self.focused_panel_name());
             return;
         }
 
@@ -456,6 +785,100 @@ impl App {
             ChatSubpanel::Composer
         };
         self.status_message = format!("Chat subpanel: {}.", self.chat_subpanel_name());
+    }
+
+    pub fn handle_composer_key(&mut self, key: KeyEvent) -> bool {
+        if !self.composer_is_focused() {
+            return false;
+        }
+
+        let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let has_super = key.modifiers.contains(KeyModifiers::SUPER);
+        let has_alt = key.modifiers.contains(KeyModifiers::ALT);
+
+        match key.code {
+            KeyCode::Char(c) if has_ctrl || has_super => match c.to_ascii_lowercase() {
+                'a' => {
+                    self.chat_cursor = 0;
+                    self.chat_preferred_column = None;
+                    true
+                }
+                'e' => {
+                    self.chat_cursor = self.chat_draft.chars().count();
+                    self.chat_preferred_column = None;
+                    true
+                }
+                _ => false,
+            },
+            KeyCode::Char(c) => {
+                if has_alt {
+                    return false;
+                }
+                self.insert_char_at_cursor(c);
+                true
+            }
+            KeyCode::Enter => {
+                if has_ctrl || has_super {
+                    self.submit_composer_message();
+                } else {
+                    self.insert_char_at_cursor('\n');
+                }
+                true
+            }
+            KeyCode::Backspace => {
+                self.delete_char_backward();
+                true
+            }
+            KeyCode::Delete => {
+                self.delete_char_forward();
+                true
+            }
+            KeyCode::Left => {
+                if has_ctrl || has_super {
+                    self.chat_cursor = 0;
+                } else {
+                    self.chat_cursor = self.chat_cursor.saturating_sub(1);
+                }
+                self.chat_preferred_column = None;
+                true
+            }
+            KeyCode::Right => {
+                let len = self.chat_draft.chars().count();
+                if has_ctrl || has_super {
+                    self.chat_cursor = len;
+                } else {
+                    self.chat_cursor = (self.chat_cursor + 1).min(len);
+                }
+                self.chat_preferred_column = None;
+                true
+            }
+            KeyCode::Home => {
+                let (start, _) = self.current_line_bounds();
+                self.chat_cursor = start;
+                self.chat_preferred_column = None;
+                true
+            }
+            KeyCode::End => {
+                let (_, end) = self.current_line_bounds();
+                self.chat_cursor = end;
+                self.chat_preferred_column = None;
+                true
+            }
+            KeyCode::Up => {
+                self.move_cursor_vertical(-1);
+                true
+            }
+            KeyCode::Down => {
+                self.move_cursor_vertical(1);
+                true
+            }
+            KeyCode::Tab => {
+                self.insert_char_at_cursor(' ');
+                self.insert_char_at_cursor(' ');
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn move_within_focused_panel(&mut self, direction: i8) {
@@ -479,24 +902,27 @@ impl App {
                         self.chat_scroll = self.chat_scroll.saturating_sub(1);
                     }
                 } else {
-                    self.status_message = String::from(
-                        "Composer focused. Text input is not wired yet.",
-                    );
+                    self.move_cursor_vertical(direction);
                 }
             }
             2 => {
-                let changed_files_len = self.selected_worktree().changed_files.len();
-                if changed_files_len == 0 {
+                let display_order = self.right_panel_display_order();
+                if display_order.is_empty() {
                     self.right_selected_idx = 0;
                     return;
                 }
-                if direction > 0 {
-                    self.right_selected_idx = (self.right_selected_idx + 1) % changed_files_len;
-                } else if self.right_selected_idx == 0 {
-                    self.right_selected_idx = changed_files_len - 1;
+                let current = display_order
+                    .iter()
+                    .position(|idx| *idx == self.right_selected_idx)
+                    .unwrap_or(0);
+                let next = if direction > 0 {
+                    (current + 1) % display_order.len()
+                } else if current == 0 {
+                    display_order.len() - 1
                 } else {
-                    self.right_selected_idx -= 1;
-                }
+                    current - 1
+                };
+                self.right_selected_idx = display_order[next];
             }
             _ => {}
         }
@@ -535,7 +961,10 @@ impl App {
         let adjusted = step.min(transferable);
 
         if adjusted == 0 {
-            self.status_message = format!("Panel '{}' reached minimum width.", self.focused_panel_name());
+            self.status_message = format!(
+                "Panel '{}' reached minimum width.",
+                self.focused_panel_name()
+            );
             return;
         }
 
@@ -561,6 +990,146 @@ impl App {
             .unwrap_or(self.providers.default_provider_id())
     }
 
+    fn should_expand_focused_panel(&self, terminal_width: u16) -> bool {
+        let config = &self.config.ui.panel_focus_expand;
+        match config.mode {
+            PanelFocusExpandMode::Off => false,
+            PanelFocusExpandMode::On => true,
+            PanelFocusExpandMode::Auto => terminal_width <= config.breakpoint_cols,
+        }
+    }
+
+    fn submit_composer_message(&mut self) {
+        let message = self.chat_draft.trim().to_owned();
+        if message.is_empty() {
+            self.status_message = String::from("Type a message before sending.");
+            return;
+        }
+
+        self.chat_messages.push(ChatMessage {
+            role: ChatRole::User,
+            content: message,
+        });
+        self.chat_draft.clear();
+        self.chat_cursor = 0;
+        self.chat_preferred_column = None;
+        self.chat_scroll = u16::MAX;
+        self.status_message = String::from("Message added to transcript.");
+    }
+
+    fn insert_char_at_cursor(&mut self, ch: char) {
+        let len = self.chat_draft.chars().count();
+        self.chat_cursor = self.chat_cursor.min(len);
+        let byte_index = byte_index_for_char(&self.chat_draft, self.chat_cursor);
+        self.chat_draft.insert(byte_index, ch);
+        self.chat_cursor += 1;
+        self.chat_preferred_column = None;
+    }
+
+    fn delete_char_backward(&mut self) {
+        if self.chat_cursor == 0 {
+            return;
+        }
+
+        let start = byte_index_for_char(&self.chat_draft, self.chat_cursor - 1);
+        let end = byte_index_for_char(&self.chat_draft, self.chat_cursor);
+        self.chat_draft.replace_range(start..end, "");
+        self.chat_cursor -= 1;
+        self.chat_preferred_column = None;
+    }
+
+    fn delete_char_forward(&mut self) {
+        let len = self.chat_draft.chars().count();
+        if self.chat_cursor >= len {
+            return;
+        }
+
+        let start = byte_index_for_char(&self.chat_draft, self.chat_cursor);
+        let end = byte_index_for_char(&self.chat_draft, self.chat_cursor + 1);
+        self.chat_draft.replace_range(start..end, "");
+        self.chat_preferred_column = None;
+    }
+
+    fn move_cursor_vertical(&mut self, direction: i8) {
+        if direction == 0 {
+            return;
+        }
+
+        let chars = self.chat_draft.chars().collect::<Vec<_>>();
+        let len = chars.len();
+        self.chat_cursor = self.chat_cursor.min(len);
+        let (line_start, line_end) = self.current_line_bounds();
+        let current_column = self.chat_cursor.saturating_sub(line_start);
+        let preferred = self.chat_preferred_column.unwrap_or(current_column);
+
+        if direction < 0 {
+            if line_start == 0 {
+                self.chat_preferred_column = Some(preferred);
+                return;
+            }
+
+            let prev_line_end = line_start - 1;
+            let prev_line_start = chars[..prev_line_end]
+                .iter()
+                .rposition(|ch| *ch == '\n')
+                .map_or(0, |idx| idx + 1);
+            let prev_line_len = prev_line_end.saturating_sub(prev_line_start);
+            self.chat_cursor = prev_line_start + preferred.min(prev_line_len);
+        } else {
+            if line_end >= len {
+                self.chat_preferred_column = Some(preferred);
+                return;
+            }
+
+            let next_line_start = line_end + 1;
+            let next_line_end = chars[next_line_start..]
+                .iter()
+                .position(|ch| *ch == '\n')
+                .map_or(len, |idx| next_line_start + idx);
+            let next_line_len = next_line_end.saturating_sub(next_line_start);
+            self.chat_cursor = next_line_start + preferred.min(next_line_len);
+        }
+
+        self.chat_preferred_column = Some(preferred);
+    }
+
+    fn current_line_bounds(&self) -> (usize, usize) {
+        let chars = self.chat_draft.chars().collect::<Vec<_>>();
+        let len = chars.len();
+        let cursor = self.chat_cursor.min(len);
+
+        let line_start = chars[..cursor]
+            .iter()
+            .rposition(|ch| *ch == '\n')
+            .map_or(0, |idx| idx + 1);
+        let line_end = chars[cursor..]
+            .iter()
+            .position(|ch| *ch == '\n')
+            .map_or(len, |idx| cursor + idx);
+
+        (line_start, line_end)
+    }
+
+    fn cursor_line_column(&self) -> (usize, usize) {
+        let cursor = self.chat_cursor.min(self.chat_draft.chars().count());
+        let mut line = 0;
+        let mut column = 0;
+
+        for (idx, ch) in self.chat_draft.chars().enumerate() {
+            if idx >= cursor {
+                break;
+            }
+            if ch == '\n' {
+                line += 1;
+                column = 0;
+            } else {
+                column += 1;
+            }
+        }
+
+        (line, column)
+    }
+
     fn persist_panel_ratios(&mut self) {
         self.config
             .set_panel_ratios(panel_ratios_from_widths(self.panel_widths));
@@ -569,17 +1138,47 @@ impl App {
         }
     }
 
-    fn sync_panel_state_for_selected_worktree(&mut self) {
-        self.chat_scroll = 0;
-        self.chat_subpanel = ChatSubpanel::Transcript;
-        let changed_files_len = self.selected_worktree().changed_files.len();
-        if changed_files_len == 0 {
+    fn ensure_right_selection_valid(&mut self) {
+        let display_order = self.right_panel_display_order();
+        if display_order.is_empty() {
             self.right_selected_idx = 0;
             return;
         }
-        if self.right_selected_idx >= changed_files_len {
-            self.right_selected_idx = changed_files_len - 1;
+
+        if !display_order.contains(&self.right_selected_idx) {
+            self.right_selected_idx = display_order[0];
         }
+    }
+
+    fn right_panel_display_order(&self) -> Vec<usize> {
+        let (mut unstaged, staged) = self.changed_file_sections();
+        let mut order = Vec::with_capacity(unstaged.len() + staged.len());
+        order.append(&mut unstaged);
+        order.extend(staged);
+        order
+    }
+
+    pub fn changed_file_sections(&self) -> (Vec<usize>, Vec<usize>) {
+        let query = self.right_search_query.trim().to_ascii_lowercase();
+        let mut unstaged = Vec::new();
+        let mut staged = Vec::new();
+        for (idx, change) in self.selected_worktree().changed_files.iter().enumerate() {
+            if !changed_file_matches_query(change.path, &query) {
+                continue;
+            }
+            if change.staged {
+                staged.push(idx);
+            } else {
+                unstaged.push(idx);
+            }
+        }
+        (unstaged, staged)
+    }
+
+    fn sync_panel_state_for_selected_worktree(&mut self) {
+        self.chat_scroll = 0;
+        self.chat_subpanel = ChatSubpanel::Transcript;
+        self.ensure_right_selection_valid();
     }
 }
 
@@ -620,9 +1219,14 @@ fn panel_ratios_from_widths(widths: [u16; PANEL_COUNT]) -> [f32; PANEL_COUNT] {
     ]
 }
 
-fn panel_widths_from_saved_ratios(ratios: Option<[f32; PANEL_COUNT]>) -> Option<[u16; PANEL_COUNT]> {
+fn panel_widths_from_saved_ratios(
+    ratios: Option<[f32; PANEL_COUNT]>,
+) -> Option<[u16; PANEL_COUNT]> {
     let ratios = ratios?;
-    if ratios.iter().any(|ratio| !ratio.is_finite() || *ratio <= 0.0) {
+    if ratios
+        .iter()
+        .any(|ratio| !ratio.is_finite() || *ratio <= 0.0)
+    {
         return None;
     }
 
@@ -641,9 +1245,141 @@ fn panel_widths_from_saved_ratios(ratios: Option<[f32; PANEL_COUNT]>) -> Option<
         return None;
     }
 
-    Some([
-        widths[0] as u16,
-        widths[1] as u16,
-        widths[2] as u16,
-    ])
+    Some([widths[0] as u16, widths[1] as u16, widths[2] as u16])
+}
+
+fn byte_index_for_char(text: &str, char_idx: usize) -> usize {
+    if char_idx == 0 {
+        return 0;
+    }
+
+    text.char_indices()
+        .nth(char_idx)
+        .map_or(text.len(), |(byte_idx, _)| byte_idx)
+}
+
+fn changed_file_matches_query(path: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+
+    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
+    if !query_contains_glob_wildcards(query) {
+        return normalized_path.contains(query);
+    }
+
+    if glob_pattern_match(query, &normalized_path) {
+        return true;
+    }
+
+    if !query.contains('/') {
+        if let Some(file_name) = normalized_path.rsplit('/').next() {
+            if glob_pattern_match(query, file_name) {
+                return true;
+            }
+        }
+
+        let prefixed = format!("**/{query}");
+        return glob_pattern_match(&prefixed, &normalized_path);
+    }
+
+    false
+}
+
+fn query_contains_glob_wildcards(query: &str) -> bool {
+    query.contains('*') || query.contains('?')
+}
+
+fn glob_pattern_match(pattern: &str, text: &str) -> bool {
+    let pattern_chars = pattern.chars().collect::<Vec<_>>();
+    let text_chars = text.chars().collect::<Vec<_>>();
+    let mut memo = vec![None; (pattern_chars.len() + 1) * (text_chars.len() + 1)];
+    glob_pattern_match_recursive(&pattern_chars, &text_chars, 0, 0, &mut memo)
+}
+
+fn glob_pattern_match_recursive(
+    pattern: &[char],
+    text: &[char],
+    pattern_idx: usize,
+    text_idx: usize,
+    memo: &mut [Option<bool>],
+) -> bool {
+    let memo_width = text.len() + 1;
+    let memo_idx = pattern_idx * memo_width + text_idx;
+    if let Some(cached) = memo[memo_idx] {
+        return cached;
+    }
+
+    let matched = if pattern_idx == pattern.len() {
+        text_idx == text.len()
+    } else {
+        match pattern[pattern_idx] {
+            '*' => {
+                let double_star =
+                    pattern_idx + 1 < pattern.len() && pattern[pattern_idx + 1] == '*';
+                if double_star {
+                    let mut next_pattern = pattern_idx + 2;
+                    while next_pattern < pattern.len() && pattern[next_pattern] == '*' {
+                        next_pattern += 1;
+                    }
+
+                    let mut cursor = text_idx;
+                    let mut found = false;
+                    while cursor <= text.len() {
+                        if glob_pattern_match_recursive(pattern, text, next_pattern, cursor, memo) {
+                            found = true;
+                            break;
+                        }
+                        cursor += 1;
+                    }
+                    found
+                } else {
+                    let mut cursor = text_idx;
+                    let mut found = false;
+                    loop {
+                        if glob_pattern_match_recursive(
+                            pattern,
+                            text,
+                            pattern_idx + 1,
+                            cursor,
+                            memo,
+                        ) {
+                            found = true;
+                            break;
+                        }
+                        if cursor >= text.len() || text[cursor] == '/' {
+                            break;
+                        }
+                        cursor += 1;
+                    }
+                    found
+                }
+            }
+            '?' => {
+                text_idx < text.len()
+                    && text[text_idx] != '/'
+                    && glob_pattern_match_recursive(
+                        pattern,
+                        text,
+                        pattern_idx + 1,
+                        text_idx + 1,
+                        memo,
+                    )
+            }
+            literal => {
+                text_idx < text.len()
+                    && literal == text[text_idx]
+                    && glob_pattern_match_recursive(
+                        pattern,
+                        text,
+                        pattern_idx + 1,
+                        text_idx + 1,
+                        memo,
+                    )
+            }
+        }
+    };
+
+    memo[memo_idx] = Some(matched);
+    matched
 }

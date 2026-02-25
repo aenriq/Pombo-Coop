@@ -1,8 +1,8 @@
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use ratatui::Frame;
 
 use crate::app::App;
 use crate::config::config_path;
@@ -43,14 +43,20 @@ pub fn render_auth_onboarding(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("- API key env var"),
         Line::from("- preferred model"),
         Line::from(""),
-        Line::from("Keys: O open link, Enter confirm login, R refresh CLI auth, P next provider, Q quit"),
+        Line::from(
+            "Keys: O open link, Enter confirm login, R refresh CLI auth, P next provider, Q quit",
+        ),
         Line::from(format!("Config file: {}", config_path().display())),
     ];
 
     let modal_area = centered_rect(74, 75, area);
     frame.render_widget(Clear, modal_area);
     let modal = Paragraph::new(onboarding_lines)
-        .style(Style::default().bg(colors.panel_background).fg(colors.panel_foreground))
+        .style(
+            Style::default()
+                .bg(colors.panel_background)
+                .fg(colors.panel_foreground),
+        )
         .wrap(Wrap { trim: false })
         .block(
             Block::default()
