@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -246,11 +248,7 @@ impl ChangedFilesPane {
             return;
         }
 
-        let footer_height = if self.focused {
-            if app.right_search_visible() { 3 } else { 2 }
-        } else {
-            0
-        };
+        let footer_height = if self.focused { 3 } else { 0 };
         let (list_area, footer_area) = if footer_height > 0 && panel_inner.height > footer_height {
             let split = Layout::default()
                 .direction(Direction::Vertical)
@@ -304,6 +302,7 @@ impl ChangedFilesPane {
             &unstaged,
             selected,
             app.right_selected_idx(),
+            app.right_multi_selected(),
             &mut selected_row,
             false,
             row_width,
@@ -315,6 +314,7 @@ impl ChangedFilesPane {
             &staged,
             selected,
             app.right_selected_idx(),
+            app.right_multi_selected(),
             &mut selected_row,
             true,
             row_width,
@@ -350,6 +350,7 @@ fn push_changed_file_section(
     file_indices: &[usize],
     worktree: &crate::app::Worktree,
     selected_file_idx: usize,
+    multi_selected: &BTreeSet<usize>,
     selected_row: &mut Option<usize>,
     fill_header_separator: bool,
     row_width: usize,
@@ -393,8 +394,9 @@ fn push_changed_file_section(
         if *idx == selected_file_idx {
             *selected_row = Some(items.len());
         }
+        let marked = multi_selected.contains(idx);
 
-        let status_width = 2usize;
+        let status_width = 4usize;
         let min_gap = 2usize;
         let plus_text = format!("+{}", change.additions);
         let minus_text = format!("-{}", change.deletions);
@@ -411,11 +413,15 @@ fn push_changed_file_section(
             .max(1);
 
         let mut row = vec![Span::styled(
+            if marked { "* " } else { "  " },
+            Style::default().fg(colors.context_label),
+        )];
+        row.push(Span::styled(
             format!("{} ", change.kind.code()),
             Style::default()
                 .fg(change_kind_color(change.kind, colors))
                 .add_modifier(Modifier::BOLD),
-        )];
+        ));
 
         if !path_prefix.is_empty() {
             row.push(Span::styled(
@@ -509,7 +515,6 @@ fn render_changed_files_footer(
 
     let trimmed_query = search_query.trim();
     let has_query = !trimmed_query.is_empty();
-    let show_search_row = search_active || has_query;
     let clear_hotkey_style = if has_query {
         Style::default()
             .fg(colors.panel_foreground)
@@ -518,21 +523,31 @@ fn render_changed_files_footer(
         Style::default().fg(colors.muted_text)
     };
 
-    let mut lines = vec![Line::from(vec![
+    let command_line = Line::from(vec![
+        Span::styled(
+            "Space",
+            Style::default()
+                .fg(colors.panel_foreground)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" mark  ", Style::default().fg(colors.muted_text)),
+        Span::styled(
+            "X",
+            Style::default()
+                .fg(colors.panel_foreground)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" clear marks  ", Style::default().fg(colors.muted_text)),
         Span::styled(
             "A",
             Style::default()
                 .fg(colors.panel_foreground)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" stage  ", Style::default().fg(colors.muted_text)),
-        Span::styled(
-            "R",
-            Style::default()
-                .fg(colors.panel_foreground)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" unstage  ", Style::default().fg(colors.muted_text)),
+        Span::styled(" (un)stage", Style::default().fg(colors.muted_text)),
+    ]);
+
+    let mut search_line = vec![
         Span::styled(
             "/",
             Style::default()
@@ -541,30 +556,28 @@ fn render_changed_files_footer(
         ),
         Span::styled(" search  ", Style::default().fg(colors.muted_text)),
         Span::styled("C", clear_hotkey_style),
-        Span::styled(" clear", Style::default().fg(colors.muted_text)),
-    ])];
-
-    if show_search_row && footer_inner.height > 1 {
-        let mut search_line = vec![
-            Span::styled("Search: ", Style::default().fg(colors.muted_text)),
+        Span::styled(" clear query", Style::default().fg(colors.muted_text)),
+    ];
+    if has_query || search_active {
+        search_line.extend([
+            Span::styled("  |  ", Style::default().fg(colors.muted_text)),
+            Span::styled("Query: ", Style::default().fg(colors.muted_text)),
             Span::styled("/", Style::default().fg(colors.panel_foreground)),
             Span::styled(
                 trimmed_query.to_string(),
                 Style::default().fg(colors.panel_foreground),
             ),
-        ];
+        ]);
         if search_active {
             search_line.push(Span::styled(
                 "█",
                 Style::default().fg(colors.panel_foreground),
             ));
         }
-        lines.push(Line::from(search_line));
     }
+    let lines = vec![command_line, Line::from(search_line)];
 
-    let footer = Paragraph::new(lines)
-        .style(panel_surface_style(colors))
-        .wrap(Wrap { trim: false });
+    let footer = Paragraph::new(lines).style(panel_surface_style(colors));
     frame.render_widget(footer, footer_inner);
 }
 

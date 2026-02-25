@@ -44,6 +44,10 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    if handle_multi_select_shortcuts(app, key) {
+        return;
+    }
+
     if handle_stage_shortcuts(app, key) {
         return;
     }
@@ -154,11 +158,29 @@ fn handle_stage_shortcuts(app: &mut App, key: KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Char('a') | KeyCode::Char('A') => {
-            app.stage_selected_changed_file();
+            app.toggle_selected_changed_file_staging();
             true
         }
-        KeyCode::Char('r') | KeyCode::Char('R') => {
-            app.unstage_selected_changed_file();
+        _ => false,
+    }
+}
+
+fn handle_multi_select_shortcuts(app: &mut App, key: KeyEvent) -> bool {
+    if app.focused_panel() != 2 || app.right_search_active() {
+        return false;
+    }
+
+    if !key.modifiers.is_empty() {
+        return false;
+    }
+
+    match key.code {
+        KeyCode::Char(' ') => {
+            app.toggle_right_multi_selected();
+            true
+        }
+        KeyCode::Char('x') | KeyCode::Char('X') => {
+            app.clear_right_multi_selected();
             true
         }
         _ => false,
@@ -285,7 +307,7 @@ fn select_changed_file_at_mouse_row(
         height: right_panel.height.saturating_sub(2),
     };
     if app.focused_panel() == 2 {
-        let footer_height = if app.right_search_visible() { 3 } else { 2 };
+        let footer_height = 3;
         if content_area.height > footer_height {
             content_area.height = content_area.height.saturating_sub(footer_height);
         }

@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::{collections::BTreeSet, process::Command};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -90,6 +90,7 @@ pub struct App {
     right_search_query: String,
     selected_idx: usize,
     right_selected_idx: usize,
+    right_multi_selected: BTreeSet<usize>,
     chat_scroll: u16,
     chat_subpanel: ChatSubpanel,
     focused_panel: usize,
@@ -289,6 +290,7 @@ impl App {
             right_search_query: String::new(),
             selected_idx: 0,
             right_selected_idx: 0,
+            right_multi_selected: BTreeSet::new(),
             chat_scroll: 0,
             chat_subpanel: ChatSubpanel::Transcript,
             focused_panel: 0,
@@ -464,10 +466,6 @@ impl App {
         !self.right_search_query.trim().is_empty()
     }
 
-    pub fn right_search_visible(&self) -> bool {
-        self.right_search_active || self.right_search_has_query()
-    }
-
     pub fn right_search_query(&self) -> &str {
         &self.right_search_query
     }
@@ -544,6 +542,44 @@ impl App {
         true
     }
 
+    pub fn right_multi_selected(&self) -> &BTreeSet<usize> {
+        &self.right_multi_selected
+    }
+
+    pub fn toggle_right_multi_selected(&mut self) {
+        if self.focused_panel != 2 {
+            self.status_message = String::from("Focus Changed Files to select files.");
+            return;
+        }
+
+        let visible = self.right_panel_display_order();
+        if visible.is_empty() {
+            self.status_message = String::from("No files to select.");
+            return;
+        }
+        if !visible.contains(&self.right_selected_idx) {
+            self.right_selected_idx = visible[0];
+        }
+
+        if !self.right_multi_selected.insert(self.right_selected_idx) {
+            self.right_multi_selected.remove(&self.right_selected_idx);
+        }
+
+        let selected_count = self.right_multi_selected.len();
+        if selected_count == 0 {
+            self.status_message = String::from("Selection cleared.");
+        } else if selected_count == 1 {
+            self.status_message = String::from("1 file selected.");
+        } else {
+            self.status_message = format!("{selected_count} files selected.");
+        }
+    }
+
+    pub fn clear_right_multi_selected(&mut self) {
+        self.right_multi_selected.clear();
+        self.status_message = String::from("Selection cleared.");
+    }
+
     pub fn changed_file_index_for_list_row(&self, row: usize) -> Option<usize> {
         let (unstaged, staged) = self.changed_file_sections();
         let mut current_row = 0usize;
@@ -574,73 +610,75 @@ impl App {
         None
     }
 
-    pub fn stage_selected_changed_file(&mut self) {
+    pub fn toggle_selected_changed_file_staging(&mut self) {
         if self.focused_panel != 2 {
-            self.status_message = String::from("Focus Changed Files to stage files.");
+            self.status_message = String::from("Focus Changed Files to update staged files.");
             return;
         }
 
-        let visible = self.right_panel_display_order();
-        if visible.is_empty() {
+        let pre_order = self.right_panel_display_order();
+        if pre_order.is_empty() {
             self.status_message = String::from("No files match current filter.");
             return;
         }
-        if !visible.contains(&self.right_selected_idx) {
-            self.right_selected_idx = visible[0];
+        if !pre_order.contains(&self.right_selected_idx) {
+            self.right_selected_idx = pre_order[0];
         }
+        let anchor_position = pre_order
+            .iter()
+            .position(|idx| *idx == self.right_selected_idx)
+            .unwrap_or(0);
+        let target_indices = self.right_action_target_indices(&pre_order);
 
         let selected_idx = self.selected_idx;
-        let file_idx = self.right_selected_idx;
-        let Some(file) = self
-            .worktrees
-            .get_mut(selected_idx)
-            .and_then(|worktree| worktree.changed_files.get_mut(file_idx))
-        else {
-            return;
-        };
+        let mut moved = BTreeSet::new();
+        let mut staged_count = 0usize;
+        let mut unstaged_count = 0usize;
+        let mut only_path = String::new();
+        for file_idx in target_indices {
+            let Some(file) = self
+                .worktrees
+                .get_mut(selected_idx)
+                .and_then(|worktree| worktree.changed_files.get_mut(file_idx))
+            else {
+                continue;
+            };
 
-        if file.staged {
-            self.status_message = format!("'{}' is already staged.", file.path);
+            file.staged = !file.staged;
+            if file.staged {
+                staged_count += 1;
+            } else {
+                unstaged_count += 1;
+            }
+
+            moved.insert(file_idx);
+            if moved.len() == 1 {
+                only_path = file.path.to_string();
+            }
+        }
+
+        if moved.is_empty() {
+            self.status_message = String::from("No files selected.");
             return;
         }
 
-        file.staged = true;
-        self.status_message = format!("Staged '{}'.", file.path);
-        self.ensure_right_selection_valid();
-    }
-
-    pub fn unstage_selected_changed_file(&mut self) {
-        if self.focused_panel != 2 {
-            self.status_message = String::from("Focus Changed Files to unstage files.");
-            return;
+        if moved.len() == 1 {
+            if staged_count == 1 {
+                self.status_message = format!("Staged '{}'.", only_path);
+            } else {
+                self.status_message = format!("Unstaged '{}'.", only_path);
+            }
+        } else {
+            self.status_message = format!(
+                "Updated {} files ({} staged, {} unstaged).",
+                moved.len(),
+                staged_count,
+                unstaged_count
+            );
         }
 
-        let visible = self.right_panel_display_order();
-        if visible.is_empty() {
-            self.status_message = String::from("No files match current filter.");
-            return;
-        }
-        if !visible.contains(&self.right_selected_idx) {
-            self.right_selected_idx = visible[0];
-        }
-
-        let selected_idx = self.selected_idx;
-        let file_idx = self.right_selected_idx;
-        let Some(file) = self
-            .worktrees
-            .get_mut(selected_idx)
-            .and_then(|worktree| worktree.changed_files.get_mut(file_idx))
-        else {
-            return;
-        };
-
-        if !file.staged {
-            self.status_message = format!("'{}' is not staged.", file.path);
-            return;
-        }
-
-        file.staged = false;
-        self.status_message = format!("Unstaged '{}'.", file.path);
+        self.advance_right_selection_after_action(&pre_order, anchor_position, &moved);
+        self.right_multi_selected.clear();
         self.ensure_right_selection_valid();
     }
 
@@ -1142,8 +1180,12 @@ impl App {
         let display_order = self.right_panel_display_order();
         if display_order.is_empty() {
             self.right_selected_idx = 0;
+            self.right_multi_selected.clear();
             return;
         }
+
+        self.right_multi_selected
+            .retain(|idx| display_order.contains(idx));
 
         if !display_order.contains(&self.right_selected_idx) {
             self.right_selected_idx = display_order[0];
@@ -1178,7 +1220,41 @@ impl App {
     fn sync_panel_state_for_selected_worktree(&mut self) {
         self.chat_scroll = 0;
         self.chat_subpanel = ChatSubpanel::Transcript;
+        self.right_multi_selected.clear();
         self.ensure_right_selection_valid();
+    }
+
+    fn right_action_target_indices(&self, pre_order: &[usize]) -> Vec<usize> {
+        if self.right_multi_selected.is_empty() {
+            return vec![self.right_selected_idx];
+        }
+
+        pre_order
+            .iter()
+            .copied()
+            .filter(|idx| self.right_multi_selected.contains(idx))
+            .collect()
+    }
+
+    fn advance_right_selection_after_action(
+        &mut self,
+        pre_order: &[usize],
+        anchor_position: usize,
+        moved: &BTreeSet<usize>,
+    ) {
+        for idx in pre_order.iter().skip(anchor_position + 1) {
+            if !moved.contains(idx) {
+                self.right_selected_idx = *idx;
+                return;
+            }
+        }
+
+        for idx in pre_order[..anchor_position].iter().rev() {
+            if !moved.contains(idx) {
+                self.right_selected_idx = *idx;
+                return;
+            }
+        }
     }
 }
 
