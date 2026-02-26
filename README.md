@@ -15,14 +15,17 @@ cargo run
   - `o`: open provider login link
   - `Enter`: confirm login completion
   - `r`: refresh local CLI login detection
+  - `t` / `y` / `F8`: run connection test
   - `p` / `Tab`: cycle provider (future provider support)
 - `q`: quit
+- `Ctrl`/`Cmd` + `t` or `Ctrl`/`Cmd` + `y` or `F8`: run provider connection test
 - `Ctrl` + `Left/Right` or `Ctrl` + `h/l`: switch focused panel
 - `Ctrl` + `Up/Down` or `Ctrl` + `j/k`: switch subpanel (in `Chat`: transcript/composer)
 - `Option` + `h/j/k/l` or `Option` + arrow keys: resize focused panel (macOS)
 - `j/k` or `Up/Down`: move within the focused panel
 - In `Worktrees` panel, movement selects previous/next worktree
 - In `Chat` panel, movement scrolls when transcript is focused
+- In `Chat` composer, `Enter` sends and `Shift+Enter` inserts newline
 - Middle panel contains two subpanels: chat transcript (top) and dashed composer (bottom)
 
 ## Notes

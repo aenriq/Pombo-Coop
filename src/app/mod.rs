@@ -1,6 +1,16 @@
-use std::{collections::BTreeSet, process::Command};
+use std::{
+    cell::Cell,
+    collections::BTreeSet,
+    fs,
+    io::{BufRead, BufReader, Write},
+    path::PathBuf,
+    process::{Command, Stdio},
+    sync::mpsc::{self, Receiver},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use serde_json::Value;
 
 use crate::config::{AppConfig, PanelFocusExpandMode};
 use crate::provider::{AuthProbe, ProviderDescriptor, ProviderRegistry};
@@ -11,6 +21,29 @@ pub const PANEL_RESIZE_STEP: i16 = 4;
 pub const PANEL_MIN_WIDTH_PERCENT: i16 = 16;
 pub const DEFAULT_PANEL_WIDTHS: [u16; PANEL_COUNT] = [34, 33, 33];
 pub const PANEL_EXPANDED_FOCUS_WIDTHS: [u16; PANEL_COUNT] = [68, 16, 16];
+const CHAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+const CONNECTION_TEST_TIMEOUT: Duration = Duration::from_secs(45);
+const MODEL_LIST_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+const MODEL_LIST_REQUEST_LIMIT: u32 = 100;
+const THINKING_LIVE_INTERVAL_MS: u64 = 120;
+const AGENT_STREAM_MIN_CHARS_PER_TICK: usize = 8;
+const THINKING_WAVE_WIDTH: usize = 8;
+const THINKING_WAVE_START_HOLD_TICKS: usize = 2;
+const THINKING_WAVE_LEVEL_GLYPHS: [char; 4] = ['⢀', '⠠', '⠐', '⠈'];
+const THINKING_WAVE_KERNEL: [u8; 8] = [0, 1, 2, 3, 3, 2, 1, 0];
+const CODEX_MODEL_CATALOG: [(&str, &str); 5] = [
+    ("gpt-5.3-codex", "Latest frontier agentic coding model."),
+    ("gpt-5.2-codex", "Frontier agentic coding model."),
+    (
+        "gpt-5.1-codex-max",
+        "Codex-optimized flagship for deep and fast reasoning.",
+    ),
+    ("gpt-5.2", "Latest frontier model with broad improvements."),
+    (
+        "gpt-5.1-codex-mini",
+        "Optimized for codex: faster and cheaper.",
+    ),
+];
 
 #[derive(Clone)]
 pub struct FileChange {
@@ -80,6 +113,22 @@ pub enum ChatSubpanel {
     Composer,
 }
 
+#[derive(Clone)]
+pub struct ModelChoice {
+    pub id: String,
+    pub description: String,
+    pub is_current: bool,
+}
+
+type ModelListFetchResult = Result<Vec<ModelChoice>, String>;
+
+struct StreamingAgentMessage {
+    message_index: usize,
+    full_message: String,
+    revealed_chars: usize,
+    total_chars: usize,
+}
+
 pub struct App {
     worktrees: Vec<Worktree>,
     chat_messages: Vec<ChatMessage>,
@@ -95,11 +144,23 @@ pub struct App {
     chat_subpanel: ChatSubpanel,
     focused_panel: usize,
     panel_widths: [u16; PANEL_COUNT],
+    chat_scroll_max_cache: Cell<u16>,
     should_quit: bool,
     status_message: String,
     ui_colors: UiColors,
     providers: ProviderRegistry,
     config: AppConfig,
+    chat_response_rx: Option<Receiver<ChatResponse>>,
+    chat_request_in_flight: bool,
+    streaming_agent_message: Option<StreamingAgentMessage>,
+    thinking_wave_step: usize,
+    model_picker_active: bool,
+    model_picker_options: Vec<ModelChoice>,
+    model_picker_selected: usize,
+    model_list_rx: Option<Receiver<ModelListFetchResult>>,
+    model_list_in_flight: bool,
+    connection_test_rx: Option<Receiver<ConnectionTestResult>>,
+    connection_test_in_flight: bool,
 }
 
 impl App {
@@ -261,28 +322,10 @@ impl App {
                     ],
                 },
             ],
-            chat_messages: vec![
-                ChatMessage {
-                    role: ChatRole::System,
-                    content: "Loaded diff context for animated-orb.ts".to_owned(),
-                },
-                ChatMessage {
-                    role: ChatRole::User,
-                    content:
-                        "Can you fix the duplicate shockwaves assignment in this block?"
-                            .to_owned(),
-                },
-                ChatMessage {
-                    role: ChatRole::Agent,
-                    content: "I found the duplicate line in the build() section.\nI am going to patch the repeated `shockwaves` assignment and keep the fallback behavior.".to_owned(),
-                },
-                ChatMessage {
-                    role: ChatRole::Agent,
-                    content:
-                        "Edit /Users/mrnugget/work/amp/cli/src/tui/widgets/animated-orb.ts"
-                            .to_owned(),
-                },
-            ],
+            chat_messages: vec![ChatMessage {
+                role: ChatRole::System,
+                content: "Agent ready. Ask about the selected worktree.".to_owned(),
+            }],
             chat_draft: String::new(),
             chat_cursor: 0,
             chat_preferred_column: None,
@@ -295,11 +338,23 @@ impl App {
             chat_subpanel: ChatSubpanel::Transcript,
             focused_panel: 0,
             panel_widths,
+            chat_scroll_max_cache: Cell::new(0),
             should_quit: false,
             status_message,
             ui_colors,
             providers,
             config,
+            chat_response_rx: None,
+            chat_request_in_flight: false,
+            streaming_agent_message: None,
+            thinking_wave_step: 0,
+            model_picker_active: false,
+            model_picker_options: Vec::new(),
+            model_picker_selected: 0,
+            model_list_rx: None,
+            model_list_in_flight: false,
+            connection_test_rx: None,
+            connection_test_in_flight: false,
         };
 
         if app.auth_required() {
@@ -686,6 +741,79 @@ impl App {
         &self.chat_messages
     }
 
+    pub fn model_picker_active(&self) -> bool {
+        self.model_picker_active
+    }
+
+    pub fn model_picker_options(&self) -> &[ModelChoice] {
+        &self.model_picker_options
+    }
+
+    pub fn model_picker_selected(&self) -> usize {
+        self.model_picker_selected
+    }
+
+    pub fn handle_model_picker_key(&mut self, key: KeyEvent) -> bool {
+        if !self.model_picker_active {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.model_picker_active = false;
+                self.status_message = String::from("Model selection canceled.");
+                true
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_model_picker_selection(-1);
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_model_picker_selection(1);
+                true
+            }
+            KeyCode::Enter => {
+                self.apply_selected_model_choice();
+                true
+            }
+            _ => true,
+        }
+    }
+
+    pub fn thinking_animation_playing(&self) -> bool {
+        self.chat_request_in_flight || self.streaming_agent_message.is_some()
+    }
+
+    pub fn thinking_tick_interval(&self) -> Duration {
+        Duration::from_millis(THINKING_LIVE_INTERVAL_MS)
+    }
+
+    pub fn advance_thinking_wave(&mut self) -> bool {
+        let mut changed = false;
+
+        if self.chat_request_in_flight {
+            let cycle_len = thinking_wave_cycle_len();
+            if cycle_len != 0 {
+                self.thinking_wave_step = (self.thinking_wave_step + 1) % cycle_len;
+                changed = true;
+            }
+        }
+
+        if self.advance_streaming_agent_message() {
+            changed = true;
+        }
+
+        changed
+    }
+
+    pub fn thinking_wave(&self) -> Option<String> {
+        if !self.chat_request_in_flight {
+            return None;
+        }
+
+        Some(render_thinking_wave(self.thinking_wave_step))
+    }
+
     pub fn chat_draft(&self) -> &str {
         &self.chat_draft
     }
@@ -696,6 +824,27 @@ impl App {
 
     pub fn chat_scroll(&self) -> u16 {
         self.chat_scroll
+    }
+
+    pub fn update_chat_scroll_max(&self, max_scroll: u16) {
+        self.chat_scroll_max_cache.set(max_scroll);
+    }
+
+    pub fn scroll_chat_transcript(&mut self, direction: i8) {
+        let max_scroll = self.chat_scroll_max_cache.get();
+        let mut scroll = if self.chat_scroll == u16::MAX {
+            max_scroll
+        } else {
+            self.chat_scroll.min(max_scroll)
+        };
+
+        if direction > 0 {
+            scroll = (scroll + 1).min(max_scroll);
+        } else if direction < 0 {
+            scroll = scroll.saturating_sub(1);
+        }
+
+        self.chat_scroll = scroll;
     }
 
     pub fn chat_subpanel(&self) -> ChatSubpanel {
@@ -746,6 +895,178 @@ impl App {
 
     pub fn status_message(&self) -> &str {
         &self.status_message
+    }
+
+    pub fn finalize_chat_scroll_anchor(&mut self) -> bool {
+        if self.chat_scroll == u16::MAX
+            && !self.chat_request_in_flight
+            && self.streaming_agent_message.is_none()
+        {
+            self.chat_scroll = self.chat_scroll_max_cache.get();
+            return true;
+        }
+        false
+    }
+
+    pub fn poll_background_updates(&mut self) -> bool {
+        let mut changed = false;
+
+        if let Some(rx) = self.chat_response_rx.take() {
+            match rx.try_recv() {
+                Ok(response) => {
+                    self.chat_request_in_flight = false;
+                    self.thinking_wave_step = 0;
+                    self.chat_scroll = u16::MAX;
+                    self.chat_subpanel = ChatSubpanel::Transcript;
+                    if response.is_error {
+                        self.streaming_agent_message = None;
+                        self.chat_messages.push(ChatMessage {
+                            role: ChatRole::System,
+                            content: response.message.clone(),
+                        });
+                        self.status_message = String::from("Agent request failed.");
+                    } else {
+                        let message_index = self.chat_messages.len();
+                        self.chat_messages.push(ChatMessage {
+                            role: ChatRole::Agent,
+                            content: String::new(),
+                        });
+                        let total_chars = response.message.chars().count();
+                        self.streaming_agent_message = Some(StreamingAgentMessage {
+                            message_index,
+                            full_message: response.message,
+                            revealed_chars: 0,
+                            total_chars,
+                        });
+                        self.advance_streaming_agent_message();
+                        self.status_message = String::from("Agent replied.");
+                    }
+                    changed = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.chat_response_rx = Some(rx);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.chat_request_in_flight = false;
+                    self.streaming_agent_message = None;
+                    self.thinking_wave_step = 0;
+                    self.chat_subpanel = ChatSubpanel::Transcript;
+                    self.chat_messages.push(ChatMessage {
+                        role: ChatRole::System,
+                        content: String::from("Agent process ended without returning a response."),
+                    });
+                    self.status_message = String::from("Agent request failed.");
+                    changed = true;
+                }
+            }
+        }
+
+        if let Some(rx) = self.connection_test_rx.take() {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.connection_test_in_flight = false;
+                    if result.ok {
+                        self.status_message = format!("Connection test passed: {}", result.detail);
+                    } else {
+                        self.status_message =
+                            String::from("Connection test failed (see Chat for details).");
+                        self.chat_messages.push(ChatMessage {
+                            role: ChatRole::System,
+                            content: format!("Connection test failed: {}", result.detail),
+                        });
+                        self.chat_scroll = u16::MAX;
+                    }
+                    changed = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.connection_test_rx = Some(rx);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.connection_test_in_flight = false;
+                    self.status_message = String::from("Connection test failed: worker crashed.");
+                    changed = true;
+                }
+            }
+        }
+
+        if let Some(rx) = self.model_list_rx.take() {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.model_list_in_flight = false;
+                    match result {
+                        Ok(choices) => {
+                            if self.model_picker_active {
+                                self.apply_model_picker_choices(choices);
+                                self.status_message = format!(
+                                    "Loaded {} models from {}.",
+                                    self.model_picker_options.len(),
+                                    self.active_provider_descriptor().display_name
+                                );
+                                changed = true;
+                            }
+                        }
+                        Err(detail) => {
+                            if self.model_picker_active {
+                                self.status_message = format!(
+                                    "Model list refresh failed (showing fallback): {detail}"
+                                );
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.model_list_rx = Some(rx);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.model_list_in_flight = false;
+                    if self.model_picker_active {
+                        self.status_message = String::from(
+                            "Model list refresh failed: background worker disconnected.",
+                        );
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        changed
+    }
+
+    pub fn run_connection_test(&mut self) {
+        if self.connection_test_in_flight {
+            self.status_message = String::from("Connection test already running.");
+            return;
+        }
+
+        if self.chat_request_in_flight {
+            self.status_message =
+                String::from("Wait for the current agent response to finish before testing.");
+            return;
+        }
+
+        let provider = self.active_provider_descriptor();
+        self.status_message = format!("Running {} connection test...", provider.display_name);
+
+        let provider_id = self.active_provider_id().to_owned();
+        let model = self.active_model_label().to_owned();
+        let (tx, rx) = mpsc::channel();
+        self.connection_test_rx = Some(rx);
+        self.connection_test_in_flight = true;
+
+        std::thread::spawn(move || {
+            let result = run_with_timeout(CONNECTION_TEST_TIMEOUT, move || {
+                run_provider_connection_test(&provider_id, &model)
+            })
+            .unwrap_or_else(|| ConnectionTestResult {
+                ok: false,
+                detail: format!(
+                    "timed out after {}s while waiting for provider reply",
+                    CONNECTION_TEST_TIMEOUT.as_secs()
+                ),
+            });
+            let _ = tx.send(result);
+        });
     }
 
     pub fn ui_colors(&self) -> UiColors {
@@ -833,6 +1154,7 @@ impl App {
         let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let has_super = key.modifiers.contains(KeyModifiers::SUPER);
         let has_alt = key.modifiers.contains(KeyModifiers::ALT);
+        let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
         match key.code {
             KeyCode::Char(c) if has_ctrl || has_super => match c.to_ascii_lowercase() {
@@ -856,10 +1178,10 @@ impl App {
                 true
             }
             KeyCode::Enter => {
-                if has_ctrl || has_super {
-                    self.submit_composer_message();
-                } else {
+                if has_shift {
                     self.insert_char_at_cursor('\n');
+                } else {
+                    self.submit_composer_message();
                 }
                 true
             }
@@ -934,11 +1256,7 @@ impl App {
             }
             1 => {
                 if self.chat_subpanel == ChatSubpanel::Transcript {
-                    if direction > 0 {
-                        self.chat_scroll = self.chat_scroll.saturating_add(1);
-                    } else {
-                        self.chat_scroll = self.chat_scroll.saturating_sub(1);
-                    }
+                    self.scroll_chat_transcript(direction);
                 } else {
                     self.move_cursor_vertical(direction);
                 }
@@ -1037,10 +1355,171 @@ impl App {
         }
     }
 
+    fn open_model_picker(&mut self) {
+        let provider_id = self.active_provider_id().to_owned();
+        let current_model = self.active_model_label().to_owned();
+        let mut options = build_fallback_model_choices(&provider_id, &current_model);
+        if options.is_empty() {
+            options.push(ModelChoice {
+                id: current_model.clone(),
+                description: String::from("Current configured model."),
+                is_current: true,
+            });
+        }
+
+        let selected = options
+            .iter()
+            .position(|option| option.id == current_model)
+            .unwrap_or(0);
+
+        self.model_picker_options = options;
+        self.model_picker_selected = selected;
+        self.model_picker_active = true;
+        self.refresh_provider_model_choices(provider_id, current_model);
+        self.status_message =
+            String::from("Select a model (j/k or arrows, Enter to apply, Esc to cancel).");
+    }
+
+    fn refresh_provider_model_choices(&mut self, provider_id: String, current_model: String) {
+        if self.model_list_in_flight {
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        self.model_list_rx = Some(rx);
+        self.model_list_in_flight = true;
+        std::thread::spawn(move || {
+            let result = run_provider_model_choices(&provider_id, &current_model);
+            let _ = tx.send(result);
+        });
+    }
+
+    fn apply_model_picker_choices(&mut self, choices: Vec<ModelChoice>) {
+        if choices.is_empty() {
+            return;
+        }
+
+        let selected_id = self
+            .model_picker_options
+            .get(self.model_picker_selected)
+            .map(|choice| choice.id.clone());
+        let current_model = self.active_model_label().to_owned();
+        let mut normalized = normalize_model_choices(choices, &current_model);
+        if normalized.is_empty() {
+            normalized.push(ModelChoice {
+                id: current_model,
+                description: String::from("Current configured model."),
+                is_current: true,
+            });
+        }
+
+        let selected = selected_id
+            .as_deref()
+            .and_then(|id| normalized.iter().position(|choice| choice.id == id))
+            .or_else(|| normalized.iter().position(|choice| choice.is_current))
+            .unwrap_or(0);
+
+        self.model_picker_options = normalized;
+        self.model_picker_selected = selected;
+    }
+
+    fn move_model_picker_selection(&mut self, direction: i8) {
+        if self.model_picker_options.is_empty() {
+            self.model_picker_selected = 0;
+            return;
+        }
+
+        let len = self.model_picker_options.len();
+        self.model_picker_selected %= len;
+        if direction > 0 {
+            self.model_picker_selected = (self.model_picker_selected + 1) % len;
+        } else if direction < 0 {
+            self.model_picker_selected = if self.model_picker_selected == 0 {
+                len - 1
+            } else {
+                self.model_picker_selected - 1
+            };
+        }
+    }
+
+    fn apply_selected_model_choice(&mut self) {
+        if self.model_picker_options.is_empty() {
+            self.model_picker_active = false;
+            self.status_message = String::from("No model options available.");
+            return;
+        }
+
+        let selected = self
+            .model_picker_options
+            .get(self.model_picker_selected)
+            .map(|choice| choice.id.clone())
+            .unwrap_or_else(|| self.active_model_label().to_owned());
+        let current = self.active_model_label().to_owned();
+        self.model_picker_active = false;
+
+        if selected == current {
+            self.status_message = format!("Model unchanged: {selected}");
+            return;
+        }
+
+        self.set_active_model(&selected);
+    }
+
+    fn set_active_model(&mut self, model: &str) {
+        let provider = self.active_provider_descriptor();
+        let provider_settings = self.config.ensure_provider(&provider);
+        provider_settings.preferred_model = Some(model.to_owned());
+        match self.config.save() {
+            Ok(()) => {
+                self.status_message = format!("Model set to {model}.");
+            }
+            Err(error) => {
+                self.status_message = format!("Model updated in memory only ({model}): {error}");
+            }
+        }
+    }
+
+    fn handle_composer_command(&mut self, message: &str) -> bool {
+        let trimmed = message.trim();
+        if !trimmed.starts_with('/') {
+            return false;
+        }
+
+        let mut tokens = trimmed.split_whitespace();
+        let command = tokens.next().unwrap_or_default();
+        match command {
+            "/model" => {
+                self.open_model_picker();
+                true
+            }
+            _ => {
+                self.status_message =
+                    format!("Unknown command '{command}'. Supported commands: /model");
+                true
+            }
+        }
+    }
+
     fn submit_composer_message(&mut self) {
         let message = self.chat_draft.trim().to_owned();
         if message.is_empty() {
             self.status_message = String::from("Type a message before sending.");
+            return;
+        }
+
+        if self.handle_composer_command(&message) {
+            self.chat_draft.clear();
+            self.chat_cursor = 0;
+            self.chat_preferred_column = None;
+            return;
+        }
+
+        if self.chat_request_in_flight {
+            self.status_message = String::from("Wait for the current agent response to finish.");
+            return;
+        }
+        if self.streaming_agent_message.is_some() {
+            self.status_message = String::from("Wait for the current agent response to finish.");
             return;
         }
 
@@ -1052,7 +1531,8 @@ impl App {
         self.chat_cursor = 0;
         self.chat_preferred_column = None;
         self.chat_scroll = u16::MAX;
-        self.status_message = String::from("Message added to transcript.");
+        self.status_message = String::from("Asking agent...");
+        self.start_agent_response();
     }
 
     fn insert_char_at_cursor(&mut self, ch: char) {
@@ -1224,6 +1704,32 @@ impl App {
         self.ensure_right_selection_valid();
     }
 
+    fn start_agent_response(&mut self) {
+        let provider_id = self.active_provider_id().to_owned();
+        let model = self.active_model_label().to_owned();
+        let worktree = self.selected_worktree().clone();
+        let chat_history = self.chat_messages.clone();
+        let (tx, rx) = mpsc::channel();
+        self.chat_response_rx = Some(rx);
+        self.chat_request_in_flight = true;
+        self.streaming_agent_message = None;
+        self.thinking_wave_step = 0;
+
+        std::thread::spawn(move || {
+            let response = run_with_timeout(CHAT_REQUEST_TIMEOUT, move || {
+                run_provider_chat(&provider_id, &model, &worktree, &chat_history)
+            })
+            .unwrap_or_else(|| ChatResponse {
+                is_error: true,
+                message: format!(
+                    "Agent request timed out after {}s. Check connectivity with Ctrl/Cmd+Y or F8.",
+                    CHAT_REQUEST_TIMEOUT.as_secs()
+                ),
+            });
+            let _ = tx.send(response);
+        });
+    }
+
     fn right_action_target_indices(&self, pre_order: &[usize]) -> Vec<usize> {
         if self.right_multi_selected.is_empty() {
             return vec![self.right_selected_idx];
@@ -1255,6 +1761,44 @@ impl App {
                 return;
             }
         }
+    }
+
+    fn advance_streaming_agent_message(&mut self) -> bool {
+        let Some(streaming) = &mut self.streaming_agent_message else {
+            return false;
+        };
+
+        if streaming.total_chars == 0 {
+            self.streaming_agent_message = None;
+            return false;
+        }
+
+        if streaming.revealed_chars >= streaming.total_chars {
+            self.streaming_agent_message = None;
+            return false;
+        }
+
+        let step = agent_stream_chars_per_tick(streaming.total_chars);
+        let previous = streaming.revealed_chars;
+        let next = previous.saturating_add(step).min(streaming.total_chars);
+
+        let start_byte = byte_index_for_char(&streaming.full_message, previous);
+        let end_byte = byte_index_for_char(&streaming.full_message, next);
+        let chunk = streaming.full_message[start_byte..end_byte].to_string();
+
+        if let Some(message) = self.chat_messages.get_mut(streaming.message_index) {
+            message.content.push_str(&chunk);
+        } else {
+            self.streaming_agent_message = None;
+            return false;
+        }
+
+        streaming.revealed_chars = next;
+        self.chat_scroll = u16::MAX;
+        if streaming.revealed_chars >= streaming.total_chars {
+            self.streaming_agent_message = None;
+        }
+        true
     }
 }
 
@@ -1332,6 +1876,919 @@ fn byte_index_for_char(text: &str, char_idx: usize) -> usize {
     text.char_indices()
         .nth(char_idx)
         .map_or(text.len(), |(byte_idx, _)| byte_idx)
+}
+
+fn agent_stream_chars_per_tick(total_chars: usize) -> usize {
+    let scaled = total_chars / 80;
+    AGENT_STREAM_MIN_CHARS_PER_TICK.max(scaled.min(24))
+}
+
+fn thinking_wave_cycle_len() -> usize {
+    if THINKING_WAVE_WIDTH == 0 || THINKING_WAVE_KERNEL.is_empty() {
+        return 0;
+    }
+
+    let max_phase = THINKING_WAVE_WIDTH + THINKING_WAVE_KERNEL.len() - 1;
+    if max_phase <= 1 {
+        return max_phase + 1;
+    }
+
+    let forward_len = max_phase + 1;
+    let reverse_len = max_phase - 1;
+    forward_len
+        .saturating_add(reverse_len)
+        .saturating_add(THINKING_WAVE_START_HOLD_TICKS)
+}
+
+fn thinking_wave_phase(step: usize) -> usize {
+    let max_phase = THINKING_WAVE_WIDTH + THINKING_WAVE_KERNEL.len() - 1;
+    if max_phase == 0 {
+        return 0;
+    }
+    if max_phase == 1 {
+        return step % 2;
+    }
+
+    let cycle_len = thinking_wave_cycle_len().max(1);
+    let tick = step % cycle_len;
+
+    let forward_len = max_phase + 1;
+    if tick < forward_len {
+        return tick;
+    }
+
+    let reverse_len = max_phase - 1;
+    let reverse_end = forward_len + reverse_len;
+    if tick < reverse_end {
+        let reverse_idx = tick - forward_len;
+        return max_phase.saturating_sub(reverse_idx + 1);
+    }
+
+    0
+}
+
+fn render_thinking_wave(step: usize) -> String {
+    if THINKING_WAVE_WIDTH == 0 || THINKING_WAVE_KERNEL.is_empty() {
+        return String::new();
+    }
+
+    let phase = thinking_wave_phase(step);
+    (0..THINKING_WAVE_WIDTH)
+        .map(|idx| {
+            let kernel_idx = phase as isize - idx as isize;
+            let level = if (0..THINKING_WAVE_KERNEL.len() as isize).contains(&kernel_idx) {
+                THINKING_WAVE_KERNEL[kernel_idx as usize] as usize
+            } else {
+                0
+            };
+            THINKING_WAVE_LEVEL_GLYPHS[level.min(THINKING_WAVE_LEVEL_GLYPHS.len() - 1)]
+        })
+        .collect()
+}
+
+fn build_fallback_model_choices(provider_id: &str, current_model: &str) -> Vec<ModelChoice> {
+    let catalog: &[(&str, &str)] = match provider_id {
+        "codex" => &CODEX_MODEL_CATALOG,
+        _ => &[],
+    };
+
+    let choices = catalog
+        .iter()
+        .map(|(id, description)| ModelChoice {
+            id: (*id).to_string(),
+            description: (*description).to_string(),
+            is_current: false,
+        })
+        .collect::<Vec<_>>();
+
+    normalize_model_choices(choices, current_model)
+}
+
+#[derive(Debug)]
+struct ChatResponse {
+    message: String,
+    is_error: bool,
+}
+
+fn run_provider_chat(
+    provider_id: &str,
+    model: &str,
+    worktree: &Worktree,
+    chat_history: &[ChatMessage],
+) -> ChatResponse {
+    match provider_id {
+        "codex" => run_codex_chat(model, worktree, chat_history),
+        other => ChatResponse {
+            is_error: true,
+            message: format!("Provider '{other}' does not support chat yet."),
+        },
+    }
+}
+
+fn run_provider_model_choices(provider_id: &str, current_model: &str) -> ModelListFetchResult {
+    match provider_id {
+        "codex" => run_codex_model_choices(current_model),
+        _ => Ok(build_fallback_model_choices(provider_id, current_model)),
+    }
+}
+
+fn run_codex_model_choices(current_model: &str) -> ModelListFetchResult {
+    let payload = run_codex_model_list_request()?;
+    parse_codex_model_list_choices(&payload, current_model)
+}
+
+fn run_codex_model_list_request() -> Result<Value, String> {
+    let mut child = Command::new("codex")
+        .arg("app-server")
+        .arg("--listen")
+        .arg("stdio://")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                String::from("Codex CLI was not found in PATH.")
+            } else {
+                format!("failed to start Codex app-server: {error}")
+            }
+        })?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| String::from("failed to open codex app-server stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| String::from("failed to open codex app-server stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| String::from("failed to open codex app-server stderr"))?;
+
+    let (stdout_tx, stdout_rx) = mpsc::channel::<String>();
+    let (stderr_tx, stderr_rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            let _ = stdout_tx.send(line);
+        }
+    });
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            let _ = stderr_tx.send(line);
+        }
+    });
+
+    let initialize = serde_json::json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {
+                "name": "agent-manager-tui",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        }
+    });
+    let initialized = serde_json::json!({ "method": "initialized" });
+    let model_list = serde_json::json!({
+        "id": 2,
+        "method": "model/list",
+        "params": {
+            "includeHidden": false,
+            "limit": MODEL_LIST_REQUEST_LIMIT
+        }
+    });
+
+    writeln!(stdin, "{initialize}")
+        .map_err(|error| format!("failed to write initialize request: {error}"))?;
+    writeln!(stdin, "{initialized}")
+        .map_err(|error| format!("failed to write initialized notification: {error}"))?;
+    writeln!(stdin, "{model_list}")
+        .map_err(|error| format!("failed to write model/list request: {error}"))?;
+    stdin
+        .flush()
+        .map_err(|error| format!("failed to flush model/list request: {error}"))?;
+
+    let deadline = Instant::now() + MODEL_LIST_REQUEST_TIMEOUT;
+    let mut response = None;
+    let mut rpc_error = None;
+    let mut stderr_lines = Vec::new();
+    loop {
+        while let Ok(line) = stderr_rx.try_recv() {
+            if is_non_fatal_codex_warning(&line) {
+                continue;
+            }
+            let simplified = simplify_error_line(&line);
+            if is_meaningful_error_line(&simplified) {
+                stderr_lines.push(simplified);
+            }
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let timeout = deadline.saturating_duration_since(now);
+        match stdout_rx.recv_timeout(timeout) {
+            Ok(line) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let Ok(payload) = serde_json::from_str::<Value>(trimmed) else {
+                    continue;
+                };
+                if payload.get("id").and_then(Value::as_i64) != Some(2) {
+                    continue;
+                }
+
+                if let Some(result) = payload.get("result") {
+                    response = Some(result.clone());
+                    break;
+                }
+                if let Some(error) = payload.get("error") {
+                    rpc_error = Some(summarize_json_rpc_error(error));
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    while let Ok(line) = stderr_rx.try_recv() {
+        if is_non_fatal_codex_warning(&line) {
+            continue;
+        }
+        let simplified = simplify_error_line(&line);
+        if is_meaningful_error_line(&simplified) {
+            stderr_lines.push(simplified);
+        }
+    }
+
+    if let Some(detail) = rpc_error {
+        return Err(detail);
+    }
+    if let Some(result) = response {
+        return Ok(result);
+    }
+    if let Some(detail) = stderr_lines.into_iter().last() {
+        return Err(detail);
+    }
+
+    Err(format!(
+        "timed out after {}s waiting for model list response",
+        MODEL_LIST_REQUEST_TIMEOUT.as_secs()
+    ))
+}
+
+fn parse_codex_model_list_choices(payload: &Value, current_model: &str) -> ModelListFetchResult {
+    let data = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| String::from("model/list response was missing 'data'"))?;
+
+    let mut seen_ids = BTreeSet::new();
+    let mut choices = Vec::new();
+    for model in data {
+        if model
+            .get("hidden")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let id = model
+            .get("id")
+            .and_then(Value::as_str)
+            .or_else(|| model.get("model").and_then(Value::as_str))
+            .unwrap_or_default()
+            .trim();
+        if id.is_empty() {
+            continue;
+        }
+        if !seen_ids.insert(id.to_owned()) {
+            continue;
+        }
+
+        let description = model
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("Available from provider.")
+            .trim();
+        let mut description = if description.is_empty() {
+            String::from("Available from provider.")
+        } else {
+            description.to_owned()
+        };
+        if model
+            .get("isDefault")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && !description.contains("(default)")
+        {
+            description.push_str(" (default)");
+        }
+
+        choices.push(ModelChoice {
+            id: id.to_owned(),
+            description,
+            is_current: false,
+        });
+    }
+
+    if choices.is_empty() {
+        return Err(String::from("provider returned no visible models."));
+    }
+
+    Ok(normalize_model_choices(choices, current_model))
+}
+
+fn normalize_model_choices(mut choices: Vec<ModelChoice>, current_model: &str) -> Vec<ModelChoice> {
+    if choices.is_empty() {
+        if current_model.is_empty() {
+            return choices;
+        }
+        return vec![ModelChoice {
+            id: current_model.to_string(),
+            description: String::from("Current configured model."),
+            is_current: true,
+        }];
+    }
+
+    for choice in &mut choices {
+        choice.is_current = choice.id == current_model;
+    }
+
+    if !current_model.is_empty() && !choices.iter().any(|choice| choice.id == current_model) {
+        choices.insert(
+            0,
+            ModelChoice {
+                id: current_model.to_string(),
+                description: String::from("Current configured model."),
+                is_current: true,
+            },
+        );
+    }
+
+    choices
+}
+
+fn summarize_json_rpc_error(error: &Value) -> String {
+    if let Some(message) = error.get("message").and_then(Value::as_str) {
+        let message = message.trim();
+        if !message.is_empty() {
+            return message.to_string();
+        }
+    }
+
+    if let Some(code) = error.get("code").and_then(Value::as_i64) {
+        let detail = error
+            .get("data")
+            .map(Value::to_string)
+            .unwrap_or_else(|| String::from("no additional data"));
+        return format!("code {code}: {detail}");
+    }
+
+    let raw = error.to_string();
+    if raw.is_empty() {
+        String::from("unknown json-rpc error")
+    } else {
+        raw
+    }
+}
+
+fn is_non_fatal_codex_warning(line: &str) -> bool {
+    line.contains("could not update PATH")
+}
+
+fn run_codex_chat(model: &str, worktree: &Worktree, chat_history: &[ChatMessage]) -> ChatResponse {
+    let prompt = build_codex_chat_prompt(worktree, chat_history);
+    match run_codex_exec_last_message(model, &prompt) {
+        Ok(message) => ChatResponse {
+            message,
+            is_error: false,
+        },
+        Err(message) => ChatResponse {
+            is_error: true,
+            message,
+        },
+    }
+}
+
+fn build_codex_chat_prompt(worktree: &Worktree, chat_history: &[ChatMessage]) -> String {
+    let mut prompt = String::from(
+        "You are an assistant inside AgentManager TUI. Reply conversationally and concisely in plain text.\n\n",
+    );
+    prompt.push_str("Current context:\n");
+    prompt.push_str(&format!(
+        "- repo: {}\n- worktree: {}\n- branch: {}\n- status: {}\n- summary: {}\n\n",
+        worktree.repo, worktree.name, worktree.branch, worktree.status, worktree.summary
+    ));
+    prompt.push_str("Conversation so far:\n");
+
+    let start = chat_history.len().saturating_sub(20);
+    for message in chat_history.iter().skip(start) {
+        let role = match message.role {
+            ChatRole::Agent => "agent",
+            ChatRole::User => "user",
+            ChatRole::System => "system",
+        };
+        prompt.push_str(&format!("{role}: {}\n", message.content));
+    }
+
+    prompt.push_str("\nRespond to the most recent user message.");
+    prompt
+}
+
+fn extract_codex_failure_detail(
+    stderr: &str,
+    stdout: &str,
+    status: std::process::ExitStatus,
+) -> String {
+    let mut lines = Vec::new();
+    lines.extend(
+        stderr
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned),
+    );
+    lines.extend(
+        stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned),
+    );
+
+    if let Some(line) = lines.iter().find(|line| {
+        line.contains("stream disconnected before completion")
+            || line.contains("error sending request for url")
+    }) {
+        return format!(
+            "{}. Check network/VPN/proxy and run Ctrl/Cmd+T.",
+            simplify_error_line(line)
+        );
+    }
+
+    if let Some(line) = lines.iter().find(|line| {
+        line.contains("Logged out")
+            || line.contains("not logged in")
+            || line.contains("authentication")
+    }) {
+        return format!(
+            "{}. Run `codex login` and retry.",
+            simplify_error_line(line)
+        );
+    }
+
+    if let Some(line) = lines
+        .iter()
+        .find(|line| line.contains("mcp startup: failed"))
+    {
+        return format!(
+            "{}. In-app chat disables shadcn MCP, but your global Codex config may still load other slow MCP servers.",
+            simplify_error_line(line)
+        );
+    }
+
+    if let Some(line) = lines
+        .iter()
+        .find(|line| line.contains("no last agent message"))
+    {
+        return format!(
+            "{}. Codex ran but did not produce a final assistant message.",
+            simplify_error_line(line)
+        );
+    }
+
+    if let Some(api_error) = summarize_structured_api_error(&lines) {
+        return api_error;
+    }
+
+    lines
+        .iter()
+        .rev()
+        .find_map(|line| {
+            let simplified = simplify_error_line(line);
+            if !is_meaningful_error_line(&simplified) {
+                None
+            } else {
+                Some(simplified)
+            }
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "request failed ({}). Codex CLI did not emit a parseable error detail.",
+                status
+            )
+        })
+}
+
+fn simplify_error_line(line: &str) -> String {
+    let trimmed = line.trim();
+    if let Some(idx) = trimmed.find("ERROR:") {
+        return trimmed[idx + "ERROR:".len()..].trim().to_string();
+    }
+    if let Some(idx) = trimmed.find("Caused by:") {
+        return trimmed[idx + "Caused by:".len()..].trim().to_string();
+    }
+
+    trimmed.to_string()
+}
+
+fn is_meaningful_error_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if matches!(trimmed, "{" | "}" | "[" | "]" | "," | ":" | "--------") {
+        return false;
+    }
+
+    if trimmed.eq_ignore_ascii_case("assistant")
+        || trimmed.eq_ignore_ascii_case("user")
+        || trimmed.eq_ignore_ascii_case("system")
+    {
+        return false;
+    }
+
+    if is_codex_metadata_line(trimmed) {
+        return false;
+    }
+
+    trimmed.chars().any(char::is_alphanumeric)
+}
+
+fn summarize_structured_api_error(lines: &[String]) -> Option<String> {
+    let mut message = None;
+    let mut code = None;
+    let mut param = None;
+
+    for line in lines {
+        if message.is_none() {
+            message = extract_json_like_field(line, "message");
+        }
+        if code.is_none() {
+            code = extract_json_like_field(line, "code");
+        }
+        if param.is_none() {
+            param = extract_json_like_field(line, "param");
+        }
+    }
+
+    if message.is_none() && code.is_none() && param.is_none() {
+        return None;
+    }
+
+    let mut detail = String::new();
+    if let Some(value) = message {
+        detail.push_str(&value);
+    }
+
+    let mut extras = Vec::new();
+    if let Some(value) = code {
+        extras.push(format!("code={value}"));
+    }
+    if let Some(value) = param {
+        extras.push(format!("param={value}"));
+    }
+
+    if !extras.is_empty() {
+        if !detail.is_empty() {
+            detail.push(' ');
+        }
+        detail.push('(');
+        detail.push_str(&extras.join(", "));
+        detail.push(')');
+    }
+
+    let normalized = detail.trim().to_ascii_lowercase();
+    if normalized.contains("unsupported_value")
+        || normalized.contains("unsupported value")
+        || normalized.contains("model_reasoning_effort")
+    {
+        detail.push_str(". Try a supported model or reasoning effort.");
+    }
+
+    Some(detail)
+}
+
+fn extract_json_like_field(line: &str, key: &str) -> Option<String> {
+    let marker = format!("\"{key}\"");
+    let key_idx = line.find(&marker)?;
+    let tail = line.get(key_idx + marker.len()..)?.trim_start();
+    if !tail.starts_with(':') {
+        return None;
+    }
+
+    let raw = tail.get(1..)?.trim_start();
+    if raw.is_empty() {
+        return None;
+    }
+
+    if let Some(quoted) = raw.strip_prefix('"') {
+        let end = quoted.find('"')?;
+        let value = quoted.get(..end)?.trim();
+        if value.is_empty() {
+            return None;
+        }
+        return Some(value.to_string());
+    }
+
+    let end = raw
+        .find(|ch: char| ch == ',' || ch == '}' || ch.is_whitespace())
+        .unwrap_or(raw.len());
+    let value = raw.get(..end)?.trim().trim_matches('"').trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+#[derive(Debug)]
+struct ConnectionTestResult {
+    ok: bool,
+    detail: String,
+}
+
+fn run_provider_connection_test(provider_id: &str, model: &str) -> ConnectionTestResult {
+    match provider_id {
+        "codex" => run_codex_connection_test(model),
+        other => ConnectionTestResult {
+            ok: false,
+            detail: format!("provider '{other}' does not support tests yet"),
+        },
+    }
+}
+
+fn run_codex_connection_test(model: &str) -> ConnectionTestResult {
+    match run_codex_exec_last_message(model, "Reply with exactly OK.") {
+        Ok(reply) => {
+            if reply.trim().eq_ignore_ascii_case("ok") {
+                return ConnectionTestResult {
+                    ok: true,
+                    detail: format!("{model} responded"),
+                };
+            }
+
+            ConnectionTestResult {
+                ok: true,
+                detail: format!(
+                    "{model} responded ({}).",
+                    truncate_for_status(reply.trim(), 48)
+                ),
+            }
+        }
+        Err(detail) => ConnectionTestResult { ok: false, detail },
+    }
+}
+
+fn run_codex_exec_last_message(model: &str, prompt: &str) -> Result<String, String> {
+    let output_last_message_path = codex_output_last_message_path();
+
+    let output = Command::new("codex")
+        .arg("exec")
+        .arg("-c")
+        .arg("mcp_servers.shadcn.enabled=false")
+        .arg("-c")
+        .arg("model_reasoning_effort=\"medium\"")
+        .arg("--skip-git-repo-check")
+        .arg("--sandbox")
+        .arg("read-only")
+        .arg("--model")
+        .arg(model)
+        .arg("--output-last-message")
+        .arg(&output_last_message_path)
+        .arg(prompt)
+        .output();
+
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            let detail = if error.kind() == std::io::ErrorKind::NotFound {
+                String::from(
+                    "Codex CLI was not found in PATH. Install/open Codex CLI first and try again.",
+                )
+            } else {
+                format!("failed to start Codex CLI: {error}")
+            };
+            return Err(detail);
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        let detail = extract_codex_failure_detail(&stderr, &stdout, output.status);
+        let _ = fs::remove_file(&output_last_message_path);
+        return Err(format!("Codex request failed: {detail}"));
+    }
+
+    let merged_output = if stdout.is_empty() {
+        stderr.clone()
+    } else if stderr.is_empty() {
+        stdout.clone()
+    } else {
+        format!("{stdout}\n{stderr}")
+    };
+
+    if let Some(message) = read_output_last_message(&output_last_message_path) {
+        let _ = fs::remove_file(&output_last_message_path);
+        return Ok(message);
+    }
+
+    let _ = fs::remove_file(&output_last_message_path);
+
+    if let Some(message) = extract_assistant_message_from_codex_stdout(&stdout)
+        .or_else(|| extract_assistant_message_from_codex_stdout(&stderr))
+        .or_else(|| extract_assistant_message_from_codex_stdout(&merged_output))
+    {
+        return Ok(message);
+    }
+
+    let detail = extract_codex_failure_detail(&stderr, &stdout, output.status);
+    Err(format!(
+        "Codex completed without a final assistant message: {detail}"
+    ))
+}
+
+fn codex_output_last_message_path() -> PathBuf {
+    let mut path = std::env::temp_dir();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    path.push(format!(
+        "agent-manager-codex-last-message-{}-{}.txt",
+        std::process::id(),
+        nonce
+    ));
+    path
+}
+
+fn read_output_last_message(path: &PathBuf) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn truncate_for_status(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+
+    let keep = max_chars - 1;
+    let prefix = value.chars().take(keep).collect::<String>();
+    format!("{prefix}…")
+}
+
+fn run_with_timeout<T, F>(timeout: Duration, task: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let output = task();
+        let _ = tx.send(output);
+    });
+
+    rx.recv_timeout(timeout).ok()
+}
+
+fn extract_assistant_message_from_codex_stdout(stdout: &str) -> Option<String> {
+    let trimmed_stdout = stdout.trim();
+    if trimmed_stdout.is_empty() {
+        return None;
+    }
+
+    let lines = stdout.lines().collect::<Vec<_>>();
+    if let Some(assistant_start) = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, line)| (line.trim().eq_ignore_ascii_case("assistant")).then_some(idx))
+    {
+        let mut body = Vec::new();
+        for line in lines.iter().skip(assistant_start + 1) {
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                if !body.is_empty() {
+                    body.push(String::new());
+                }
+                continue;
+            }
+
+            if looks_like_codex_log_line(trimmed)
+                || trimmed.starts_with("mcp: ")
+                || trimmed.starts_with("mcp startup:")
+                || trimmed.eq_ignore_ascii_case("user")
+                || trimmed.eq_ignore_ascii_case("assistant")
+            {
+                break;
+            }
+
+            body.push(trimmed.to_string());
+        }
+
+        let transcript_message = body.join("\n").trim().to_string();
+        if !transcript_message.is_empty() {
+            return Some(transcript_message);
+        }
+    }
+
+    let mut trailing_block = Vec::new();
+    let mut stopped_on_user_or_system = false;
+    for line in lines.iter().rev() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            if !trailing_block.is_empty() {
+                trailing_block.push(String::new());
+            }
+            continue;
+        }
+
+        if trimmed.eq_ignore_ascii_case("assistant")
+            || trimmed.eq_ignore_ascii_case("user")
+            || trimmed.eq_ignore_ascii_case("system")
+        {
+            stopped_on_user_or_system =
+                trimmed.eq_ignore_ascii_case("user") || trimmed.eq_ignore_ascii_case("system");
+            break;
+        }
+
+        if is_codex_metadata_line(trimmed) {
+            if !trailing_block.is_empty() {
+                break;
+            }
+            continue;
+        }
+
+        trailing_block.push(trimmed.to_string());
+    }
+
+    while matches!(trailing_block.last(), Some(line) if line.is_empty()) {
+        trailing_block.pop();
+    }
+
+    trailing_block.reverse();
+    let trailing_message = trailing_block.join("\n").trim().to_string();
+    if !trailing_message.is_empty() && !stopped_on_user_or_system {
+        return Some(trailing_message);
+    }
+
+    if !lines.iter().any(|line| is_codex_metadata_line(line.trim())) {
+        return Some(trimmed_stdout.to_string());
+    }
+
+    None
+}
+
+fn looks_like_codex_log_line(line: &str) -> bool {
+    line.len() > 24
+        && line.chars().nth(4) == Some('-')
+        && line.contains('T')
+        && (line.contains(" WARN ")
+            || line.contains(" ERROR ")
+            || line.contains(" INFO ")
+            || line.contains(" DEBUG "))
+}
+
+fn is_codex_metadata_line(line: &str) -> bool {
+    looks_like_codex_log_line(line)
+        || line.starts_with("mcp: ")
+        || line.starts_with("mcp startup:")
+        || line.starts_with("OpenAI Codex")
+        || line.starts_with("--------")
+        || line.starts_with("workdir:")
+        || line.starts_with("model:")
+        || line.starts_with("provider:")
+        || line.starts_with("approval:")
+        || line.starts_with("sandbox:")
+        || line.starts_with("reasoning effort:")
+        || line.starts_with("reasoning summaries:")
+        || line.starts_with("session id:")
+        || line.starts_with("Reconnecting...")
+        || line.starts_with("WARNING:")
+        || line.starts_with("ERROR:")
 }
 
 fn changed_file_matches_query(path: &str, query: &str) -> bool {
@@ -1458,4 +2915,191 @@ fn glob_pattern_match_recursive(
 
     memo[memo_idx] = Some(matched);
     matched
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        extract_assistant_message_from_codex_stdout, extract_codex_failure_detail,
+        normalize_model_choices, parse_codex_model_list_choices, render_thinking_wave,
+        summarize_structured_api_error, thinking_wave_cycle_len,
+    };
+    use serde_json::json;
+
+    fn failing_status() -> std::process::ExitStatus {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 7")
+            .status()
+            .expect("failed to create exit status for test")
+    }
+
+    #[test]
+    fn extracts_assistant_block_from_transcript() {
+        let output = "\
+OpenAI Codex v0.104.0
+--------
+user
+Say hi
+assistant
+Hi there
+";
+
+        assert_eq!(
+            extract_assistant_message_from_codex_stdout(output),
+            Some(String::from("Hi there"))
+        );
+    }
+
+    #[test]
+    fn extracts_plain_output_without_transcript_markers() {
+        assert_eq!(
+            extract_assistant_message_from_codex_stdout("OK"),
+            Some(String::from("OK"))
+        );
+    }
+
+    #[test]
+    fn does_not_treat_user_prompt_as_assistant_reply() {
+        let output = "\
+OpenAI Codex v0.104.0
+--------
+workdir: /tmp
+user
+Reply with exactly OK.
+";
+
+        assert_eq!(extract_assistant_message_from_codex_stdout(output), None);
+    }
+
+    #[test]
+    fn captures_full_trailing_message_without_assistant_marker() {
+        let output = "\
+OpenAI Codex v0.104.0
+--------
+mcp startup: no servers
+
+Here are the steps:
+1. Create a ShaderMaterial and new shader.
+2. Paste your shader code and assign it.
+
+That's all you need to attach and iterate on shaders in Godot.
+2026-02-25T22:23:21.809926Z  WARN codex_core::state_db: sample warning
+";
+
+        let parsed = extract_assistant_message_from_codex_stdout(output)
+            .expect("expected trailing assistant-like message");
+        assert!(parsed.contains("Here are the steps:"));
+        assert!(parsed.contains("That's all you need"));
+    }
+
+    #[test]
+    fn extracts_network_failure_detail() {
+        let stderr = "ERROR: stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses)";
+        let detail = extract_codex_failure_detail(stderr, "", failing_status());
+
+        assert!(detail.contains("stream disconnected before completion"));
+        assert!(detail.contains("Check network/VPN/proxy"));
+    }
+
+    #[test]
+    fn ignores_brace_only_fallback_noise() {
+        let stderr = "\
+OpenAI Codex v0.104.0
+--------
+}
+";
+        let detail = extract_codex_failure_detail(stderr, "", failing_status());
+
+        assert!(detail.contains("request failed"));
+        assert_ne!(detail.trim(), "}");
+    }
+
+    #[test]
+    fn summarizes_structured_api_error_fields() {
+        let lines = vec![
+            String::from("{"),
+            String::from("\"message\": \"Invalid value for model_reasoning_effort\""),
+            String::from("\"code\": \"unsupported_value\""),
+            String::from("\"param\": \"model_reasoning_effort\""),
+            String::from("}"),
+        ];
+
+        let detail = summarize_structured_api_error(&lines).expect("expected structured summary");
+        assert!(detail.contains("Invalid value for model_reasoning_effort"));
+        assert!(detail.contains("code=unsupported_value"));
+        assert!(detail.contains("param=model_reasoning_effort"));
+    }
+
+    #[test]
+    fn thinking_wave_boomerangs() {
+        assert_eq!(thinking_wave_cycle_len(), 32);
+        assert_eq!(render_thinking_wave(0), "⢀⢀⢀⢀⢀⢀⢀⢀");
+        assert_eq!(render_thinking_wave(1), "⠠⢀⢀⢀⢀⢀⢀⢀");
+        assert_eq!(render_thinking_wave(2), "⠐⠠⢀⢀⢀⢀⢀⢀");
+        assert_eq!(render_thinking_wave(3), "⠈⠐⠠⢀⢀⢀⢀⢀");
+        assert_eq!(render_thinking_wave(4), "⠈⠈⠐⠠⢀⢀⢀⢀"); // 33210000
+        assert_eq!(render_thinking_wave(5), "⠐⠈⠈⠐⠠⢀⢀⢀"); // 23321000
+        assert_eq!(render_thinking_wave(6), "⠠⠐⠈⠈⠐⠠⢀⢀"); // 12332100
+        assert_eq!(render_thinking_wave(7), "⢀⠠⠐⠈⠈⠐⠠⢀"); // 01233210
+        assert_eq!(render_thinking_wave(15), "⢀⢀⢀⢀⢀⢀⢀⢀");
+        assert_eq!(render_thinking_wave(16), "⢀⢀⢀⢀⢀⢀⢀⢀");
+        assert_eq!(render_thinking_wave(17), "⢀⢀⢀⢀⢀⢀⢀⠠");
+        assert_eq!(render_thinking_wave(21), "⢀⢀⢀⠠⠐⠈⠈⠐");
+        assert_eq!(render_thinking_wave(23), "⢀⠠⠐⠈⠈⠐⠠⢀");
+        assert_eq!(render_thinking_wave(29), "⠠⢀⢀⢀⢀⢀⢀⢀");
+        assert_eq!(render_thinking_wave(30), render_thinking_wave(0));
+        assert_eq!(render_thinking_wave(31), render_thinking_wave(0));
+        assert_eq!(render_thinking_wave(32), render_thinking_wave(0));
+        assert_eq!(render_thinking_wave(33), render_thinking_wave(1));
+    }
+
+    #[test]
+    fn parses_model_list_response_and_marks_current() {
+        let payload = json!({
+            "data": [
+                {
+                    "id": "gpt-5.3-codex",
+                    "description": "Latest frontier agentic coding model.",
+                    "hidden": false,
+                    "isDefault": true
+                },
+                {
+                    "id": "gpt-5.2-codex",
+                    "description": "Frontier agentic coding model.",
+                    "hidden": false,
+                    "isDefault": false
+                }
+            ]
+        });
+
+        let choices = parse_codex_model_list_choices(&payload, "gpt-5.2-codex")
+            .expect("expected parsed model list");
+        assert_eq!(choices.len(), 2);
+        assert!(
+            choices
+                .iter()
+                .any(|choice| choice.id == "gpt-5.2-codex" && choice.is_current)
+        );
+        assert!(
+            choices.iter().any(
+                |choice| choice.id == "gpt-5.3-codex" && choice.description.contains("default")
+            )
+        );
+    }
+
+    #[test]
+    fn normalize_model_choices_inserts_current_when_missing() {
+        let choices = normalize_model_choices(
+            vec![super::ModelChoice {
+                id: String::from("gpt-5.3-codex"),
+                description: String::from("Latest"),
+                is_current: false,
+            }],
+            "custom-model",
+        );
+
+        assert_eq!(choices[0].id, "custom-model");
+        assert!(choices[0].is_current);
+    }
 }

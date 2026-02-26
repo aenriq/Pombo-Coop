@@ -57,30 +57,61 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> 
     let mut needs_redraw = true;
     let mut show_caret = true;
     let mut last_blink = Instant::now();
+    let mut last_thinking_tick = Instant::now();
     let blink_interval = Duration::from_millis(530);
 
     loop {
+        if app.poll_background_updates() {
+            show_caret = true;
+            needs_redraw = true;
+        }
+
         if needs_redraw {
             terminal.draw(|frame| ui::render(frame, &app, show_caret))?;
             needs_redraw = false;
+            let _ = app.finalize_chat_scroll_anchor();
         }
 
         if app.should_quit() {
             return Ok(());
         }
 
-        let timeout = if app.composer_is_focused() {
-            blink_interval
-                .checked_sub(last_blink.elapsed())
-                .unwrap_or(Duration::from_millis(0))
-        } else {
-            Duration::from_millis(250)
-        };
+        let mut timeout = Duration::from_millis(250);
+        if app.composer_is_focused() {
+            timeout = timeout.min(
+                blink_interval
+                    .checked_sub(last_blink.elapsed())
+                    .unwrap_or(Duration::from_millis(0)),
+            );
+        }
+        if app.thinking_animation_playing() {
+            let thinking_interval = app.thinking_tick_interval();
+            timeout = timeout.min(
+                thinking_interval
+                    .checked_sub(last_thinking_tick.elapsed())
+                    .unwrap_or(Duration::from_millis(0)),
+            );
+        }
 
         if !event::poll(timeout)? {
+            let mut should_redraw = false;
             if app.composer_is_focused() {
-                show_caret = !show_caret;
-                last_blink = Instant::now();
+                if last_blink.elapsed() >= blink_interval {
+                    show_caret = !show_caret;
+                    last_blink = Instant::now();
+                    should_redraw = true;
+                }
+            }
+            if app.thinking_animation_playing() {
+                let thinking_interval = app.thinking_tick_interval();
+                if last_thinking_tick.elapsed() >= thinking_interval {
+                    if app.advance_thinking_wave() {
+                        should_redraw = true;
+                    }
+                    last_thinking_tick = Instant::now();
+                }
+            }
+            if should_redraw {
                 needs_redraw = true;
             }
             continue;
@@ -92,11 +123,13 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> 
                     handle_key_event(&mut app, key);
                     show_caret = true;
                     last_blink = Instant::now();
+                    last_thinking_tick = Instant::now();
                     needs_redraw = true;
                 }
             }
             Event::Resize(_, _) => {
                 show_caret = true;
+                last_thinking_tick = Instant::now();
                 needs_redraw = true;
             }
             Event::Mouse(mouse) => {
@@ -104,6 +137,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> 
                 let area = Rect::new(0, 0, size.width, size.height);
                 if handle_mouse_event(&mut app, mouse, area) {
                     show_caret = true;
+                    last_thinking_tick = Instant::now();
                     needs_redraw = true;
                 }
             }

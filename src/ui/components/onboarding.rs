@@ -44,7 +44,7 @@ pub fn render_auth_onboarding(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("- preferred model"),
         Line::from(""),
         Line::from(
-            "Keys: O open link, Enter confirm login, R refresh CLI auth, P next provider, Q quit",
+            "Keys: O open link, Enter confirm login, R refresh CLI auth, T/Y/F8 test connection, P next provider, Q quit",
         ),
         Line::from(format!("Config file: {}", config_path().display())),
     ];

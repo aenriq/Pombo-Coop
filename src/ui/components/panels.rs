@@ -1,12 +1,15 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Wrap,
+};
 
-use crate::app::{App, ChatRole, ChatSubpanel, FileChangeKind};
+use crate::app::{App, ChatRole, ChatSubpanel, FileChangeKind, ModelChoice};
 use crate::theme::UiColors;
 use crate::ui::components::pane_chrome::PaneChrome;
 
@@ -24,6 +27,9 @@ pub fn render_middle_panel(
 ) {
     let colors = app.ui_colors();
     ChatPane::new(focused, app.chat_subpanel(), colors, show_caret).draw(frame, app, area);
+    if app.model_picker_active() {
+        render_model_picker_overlay(frame, app, area, colors);
+    }
 }
 
 pub fn render_right_panel(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
@@ -121,26 +127,83 @@ impl ChatPane {
             .constraints([Constraint::Min(8), Constraint::Length(7)])
             .split(outer_inner);
 
+        let (transcript_column_area, transcript_scrollbar_area) = if chat_layout[0].width > 1 {
+            let split = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .split(chat_layout[0]);
+            (split[0], Some(split[1]))
+        } else {
+            (chat_layout[0], None)
+        };
+
+        let transcript_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(transcript_column_area);
+        let transcript_text_area = transcript_layout[0];
+        let transcript_indicator_area = Rect {
+            x: chat_layout[0].x,
+            y: transcript_layout[1].y,
+            width: chat_layout[0].width,
+            height: transcript_layout[1].height,
+        };
+
         let transcript = build_chat_transcript_lines(app, self.colors);
-        let transcript_viewport_rows = chat_layout[0].height as usize;
-        let transcript_max_scroll =
-            transcript.len().saturating_sub(transcript_viewport_rows) as u16;
+        let transcript_viewport_rows = transcript_text_area.height as usize;
+        let transcript_total_rows =
+            wrapped_line_count(&transcript, transcript_text_area.width as usize);
+        let transcript_max_scroll = transcript_total_rows
+            .saturating_sub(transcript_viewport_rows)
+            .min(u16::MAX as usize) as u16;
+        app.update_chat_scroll_max(transcript_max_scroll);
         let transcript_scroll = app.chat_scroll().min(transcript_max_scroll);
 
         let transcript_panel = Paragraph::new(transcript)
             .style(panel_surface_style(self.colors))
             .scroll((transcript_scroll, 0))
             .wrap(Wrap { trim: false });
-        frame.render_widget(transcript_panel, chat_layout[0]);
+        frame.render_widget(transcript_panel, transcript_text_area);
 
-        if transcript_focused {
-            let divider = Block::default().borders(Borders::BOTTOM).border_style(
-                Style::default()
-                    .fg(self.colors.border_focused)
-                    .add_modifier(Modifier::BOLD),
-            );
-            frame.render_widget(divider, chat_layout[0]);
+        if transcript_max_scroll > 0 {
+            if let Some(scrollbar_area) = transcript_scrollbar_area {
+                let scrollbar_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(1)])
+                    .split(scrollbar_area);
+                let scrollbar_content_area = scrollbar_layout[0];
+                let scrollbar_position = if transcript_max_scroll == 0 {
+                    0
+                } else {
+                    let max_thumb_position = transcript_total_rows.saturating_sub(1) as f64;
+                    ((transcript_scroll as f64 / transcript_max_scroll as f64) * max_thumb_position)
+                        .round() as usize
+                };
+                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .thumb_symbol("█")
+                    .thumb_style(Style::default().fg(self.colors.border_focused))
+                    .track_symbol(None)
+                    .begin_symbol(None)
+                    .end_symbol(None);
+                let mut scrollbar_state = ScrollbarState::new(transcript_total_rows.max(1))
+                    .position(scrollbar_position)
+                    .viewport_content_length(transcript_viewport_rows.max(1));
+                frame.render_stateful_widget(
+                    scrollbar,
+                    scrollbar_content_area,
+                    &mut scrollbar_state,
+                );
+            }
         }
+
+        render_transcript_indicator_row(
+            frame,
+            transcript_indicator_area,
+            transcript_focused,
+            transcript_scroll,
+            transcript_max_scroll,
+            self.colors,
+        );
 
         let textarea_title = Line::from(vec![Span::styled(
             "Message".to_string(),
@@ -179,7 +242,7 @@ impl ChatPane {
 
         let draft_lines = if app.chat_draft().is_empty() {
             vec![Line::from(Span::styled(
-                "Type a message (Ctrl+Enter to send)",
+                "Type a message (Enter to send, Shift+Enter for newline)",
                 Style::default().fg(self.colors.muted_text),
             ))]
         } else {
@@ -220,6 +283,308 @@ impl ChatPane {
             }
         }
     }
+}
+
+fn wrapped_line_count(lines: &[Line<'_>], wrap_width: usize) -> usize {
+    if wrap_width == 0 {
+        return 0;
+    }
+
+    lines
+        .iter()
+        .map(|line| wrapped_rows_for_line(line, wrap_width))
+        .sum()
+}
+
+fn wrapped_rows_for_line(line: &Line<'_>, wrap_width: usize) -> usize {
+    if wrap_width == 0 {
+        return 0;
+    }
+
+    // Ratatui wraps on word boundaries; using plain ceil(width/wrap_width) can undercount rows
+    // and make the transcript's last wrapped lines unreachable by scroll.
+    let mut line_width = 0usize;
+    let mut word_width = 0usize;
+    let mut whitespace_width = 0usize;
+    let mut pending_whitespace = VecDeque::<usize>::new();
+    let mut non_whitespace_previous = false;
+    let mut wrapped_rows = 0usize;
+    let mut saw_symbol = false;
+
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            let symbol_width = display_width(ch);
+            if symbol_width > wrap_width {
+                continue;
+            }
+
+            saw_symbol = true;
+            let is_whitespace = ch.is_whitespace();
+            let word_found = non_whitespace_previous && is_whitespace;
+            let untrimmed_overflow = line_width == 0
+                && word_width + whitespace_width + symbol_width > wrap_width;
+
+            if word_found || untrimmed_overflow {
+                line_width += whitespace_width;
+                line_width += word_width;
+                pending_whitespace.clear();
+                whitespace_width = 0;
+                word_width = 0;
+            }
+
+            let line_full = line_width >= wrap_width;
+            let pending_word_overflow =
+                symbol_width > 0 && line_width + whitespace_width + word_width >= wrap_width;
+
+            if line_full || pending_word_overflow {
+                let mut remaining_width = wrap_width.saturating_sub(line_width);
+                while let Some(width) = pending_whitespace.front().copied() {
+                    if width > remaining_width {
+                        break;
+                    }
+
+                    whitespace_width = whitespace_width.saturating_sub(width);
+                    remaining_width = remaining_width.saturating_sub(width);
+                    pending_whitespace.pop_front();
+                }
+
+                wrapped_rows += 1;
+                line_width = 0;
+
+                // First whitespace on a wrapped line is dropped from the next segment.
+                if is_whitespace && pending_whitespace.is_empty() {
+                    non_whitespace_previous = false;
+                    continue;
+                }
+            }
+
+            if is_whitespace {
+                whitespace_width += symbol_width;
+                pending_whitespace.push_back(symbol_width);
+            } else {
+                word_width += symbol_width;
+            }
+
+            non_whitespace_previous = !is_whitespace;
+        }
+    }
+
+    if !saw_symbol {
+        return 1;
+    }
+
+    if line_width == 0 && word_width == 0 && whitespace_width > 0 {
+        wrapped_rows += 1;
+    } else {
+        line_width += whitespace_width;
+        line_width += word_width;
+        if line_width > 0 {
+            wrapped_rows += 1;
+        }
+    }
+
+    wrapped_rows.max(1)
+}
+
+fn display_width(ch: char) -> usize {
+    if ch == '\t' {
+        4
+    } else if ch.is_control() {
+        0
+    } else {
+        1
+    }
+}
+
+fn render_transcript_indicator_row(
+    frame: &mut Frame,
+    area: Rect,
+    focused: bool,
+    scroll: u16,
+    max_scroll: u16,
+    colors: UiColors,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let can_scroll_up = scroll > 0;
+    let can_scroll_down = scroll < max_scroll;
+    let mut cells = vec!['─'; area.width as usize];
+    let mut up_idx = None;
+    let mut down_idx = None;
+    if !cells.is_empty() {
+        if can_scroll_up {
+            cells[0] = '↑';
+            up_idx = Some(0usize);
+        }
+        let last = cells.len() - 1;
+        if can_scroll_down {
+            cells[last] = '↓';
+            down_idx = Some(last);
+        } else if !can_scroll_up {
+            cells[last] = ' ';
+        }
+    }
+
+    let base_style = Style::default()
+        .bg(colors.panel_background)
+        .fg(if focused {
+            colors.border_focused
+        } else {
+            colors.border_default
+        })
+        .add_modifier(if focused {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        });
+    let arrow_style = base_style.fg(Color::Indexed(221));
+    let indicator_line = Line::from(
+        cells
+            .into_iter()
+            .enumerate()
+            .map(|(idx, ch)| {
+                let style = if Some(idx) == up_idx || Some(idx) == down_idx {
+                    arrow_style
+                } else {
+                    base_style
+                };
+                Span::styled(ch.to_string(), style)
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    frame.render_widget(Paragraph::new(indicator_line), area);
+}
+
+fn render_model_picker_overlay(frame: &mut Frame, app: &App, area: Rect, colors: UiColors) {
+    if area.width < 30 || area.height < 10 {
+        return;
+    }
+
+    let popup_width = area.width.saturating_sub(6).min(96);
+    let popup_height = area.height.saturating_sub(6).min(16);
+    if popup_width < 24 || popup_height < 8 {
+        return;
+    }
+
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(popup_width)) / 2,
+        y: area.y + (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title("Select Model")
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(colors.border_focused)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(panel_surface_style(colors));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    if inner.width < 4 || inner.height < 5 {
+        return;
+    }
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let header = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "Use /model in composer to open this selector.",
+            Style::default().fg(colors.muted_text),
+        )),
+        Line::from(Span::styled(
+            "Enter: apply model    Esc: dismiss",
+            Style::default().fg(colors.muted_text),
+        )),
+    ])
+    .style(panel_surface_style(colors))
+    .wrap(Wrap { trim: false });
+    frame.render_widget(header, layout[0]);
+
+    let items = app
+        .model_picker_options()
+        .iter()
+        .enumerate()
+        .map(|(idx, choice)| render_model_choice_item(idx, choice, colors))
+        .collect::<Vec<_>>();
+    let list = List::new(items)
+        .style(panel_surface_style(colors))
+        .highlight_style(
+            Style::default()
+                .bg(colors.list_highlight_background)
+                .fg(colors.list_highlight_foreground)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("› ");
+
+    let mut state = ListState::default();
+    state.select(Some(
+        app.model_picker_selected()
+            .min(app.model_picker_options().len().saturating_sub(1)),
+    ));
+    frame.render_stateful_widget(list, layout[1], &mut state);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled("Current: ", Style::default().fg(colors.muted_text)),
+        Span::styled(
+            app.active_model_label().to_owned(),
+            Style::default()
+                .fg(colors.panel_foreground)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]))
+    .style(panel_surface_style(colors))
+    .wrap(Wrap { trim: false });
+    frame.render_widget(footer, layout[2]);
+}
+
+fn render_model_choice_item(
+    idx: usize,
+    choice: &ModelChoice,
+    colors: UiColors,
+) -> ListItem<'static> {
+    let mut line = vec![
+        Span::styled(
+            format!("{}. ", idx + 1),
+            Style::default().fg(colors.muted_text),
+        ),
+        Span::styled(
+            choice.id.clone(),
+            Style::default()
+                .fg(colors.panel_foreground)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if choice.is_current {
+        line.push(Span::styled(
+            " (current)",
+            Style::default()
+                .fg(colors.role_agent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    line.push(Span::raw("  "));
+    line.push(Span::styled(
+        choice.description.clone(),
+        Style::default().fg(colors.muted_text),
+    ));
+
+    ListItem::new(Line::from(line))
 }
 
 struct ChangedFilesPane {
@@ -678,6 +1043,29 @@ fn build_chat_transcript_lines(app: &App, colors: UiColors) -> Vec<Line<'static>
                 lines.push(Line::from(vec![Span::raw(format!("  {entry_line}"))]));
             }
         }
+        lines.push(Line::from(""));
+    }
+
+    if let Some(wave) = app.thinking_wave() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "agent",
+                Style::default()
+                    .fg(colors.role_agent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("thinking ", Style::default().fg(colors.muted_text)),
+            Span::styled(
+                wave,
+                Style::default()
+                    .fg(colors.role_agent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
         lines.push(Line::from(""));
     }
 

@@ -27,6 +27,8 @@ pub fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         focus_expand,
         app.status_message()
     );
+    let max_chars = area.width.saturating_sub(1) as usize;
+    let status_text = truncate_for_bar(&status_text, max_chars);
     let status = Paragraph::new(status_text)
         .style(
             Style::default()
@@ -39,4 +41,20 @@ pub fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 .border_style(Style::default().fg(colors.border_default)),
         );
     frame.render_widget(status, area);
+}
+
+fn truncate_for_bar(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+
+    let keep = max_chars - 1;
+    let prefix = value.chars().take(keep).collect::<String>();
+    format!("{prefix}…")
 }

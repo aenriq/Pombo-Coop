@@ -9,6 +9,19 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    if app.handle_model_picker_key(key) {
+        return;
+    }
+
+    if is_connection_test_shortcut(&key) {
+        app.run_connection_test();
+        return;
+    }
+
+    if handle_chat_transcript_scroll_shortcuts(app, key) {
+        return;
+    }
+
     if app.handle_composer_key(key) {
         return;
     }
@@ -63,6 +76,16 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_auth_key_event(app: &mut App, key: KeyEvent) {
+    if is_connection_test_shortcut(&key)
+        || matches!(
+            key.code,
+            KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Char('y') | KeyCode::Char('Y')
+        )
+    {
+        app.run_connection_test();
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q') => app.request_quit(),
         KeyCode::Char('o') | KeyCode::Char('O') => app.open_provider_login(),
@@ -73,6 +96,22 @@ fn handle_auth_key_event(app: &mut App, key: KeyEvent) {
         KeyCode::Char('p') | KeyCode::Char('P') | KeyCode::Tab => app.cycle_provider(),
         _ => {}
     }
+}
+
+fn is_connection_test_shortcut(key: &KeyEvent) -> bool {
+    if key.modifiers.is_empty() && matches!(key.code, KeyCode::F(8)) {
+        return true;
+    }
+
+    let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let has_super = key.modifiers.contains(KeyModifiers::SUPER);
+    let has_alt = key.modifiers.contains(KeyModifiers::ALT);
+    (has_ctrl || has_super)
+        && !has_alt
+        && matches!(
+            key.code,
+            KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Char('y') | KeyCode::Char('Y')
+        )
 }
 
 fn panel_focus_direction(key: &KeyEvent) -> Option<i8> {
@@ -140,6 +179,29 @@ fn panel_move_direction(key: &KeyEvent) -> Option<i8> {
         KeyCode::Down | KeyCode::Char('j') => Some(1),
         KeyCode::Up | KeyCode::Char('k') => Some(-1),
         _ => None,
+    }
+}
+
+fn handle_chat_transcript_scroll_shortcuts(app: &mut App, key: KeyEvent) -> bool {
+    if app.focused_panel() != 1 || !key.modifiers.is_empty() {
+        return false;
+    }
+
+    let step = 6;
+    match key.code {
+        KeyCode::PageUp => {
+            for _ in 0..step {
+                app.scroll_chat_transcript(-1);
+            }
+            true
+        }
+        KeyCode::PageDown => {
+            for _ in 0..step {
+                app.scroll_chat_transcript(1);
+            }
+            true
+        }
+        _ => false,
     }
 }
 
@@ -266,26 +328,38 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent, terminal_area: Rect)
 
             select_changed_file_at_mouse_row(app, columns[2], mouse.row, false)
         }
-        MouseEventKind::ScrollUp => {
-            if panel_idx != 2 {
-                return false;
+        MouseEventKind::ScrollUp => match panel_idx {
+            1 => {
+                let was_focused = app.focused_panel();
+                app.focus_panel_by_index(1);
+                app.focus_subpanel(-1);
+                app.scroll_chat_transcript(-1);
+                was_focused != 1 || !app.chat_messages().is_empty()
             }
-
-            let was_focused = app.focused_panel();
-            app.focus_panel_by_index(2);
-            app.move_within_focused_panel(-1);
-            was_focused != 2 || !app.selected_worktree().changed_files.is_empty()
-        }
-        MouseEventKind::ScrollDown => {
-            if panel_idx != 2 {
-                return false;
+            2 => {
+                let was_focused = app.focused_panel();
+                app.focus_panel_by_index(2);
+                app.move_within_focused_panel(-1);
+                was_focused != 2 || !app.selected_worktree().changed_files.is_empty()
             }
-
-            let was_focused = app.focused_panel();
-            app.focus_panel_by_index(2);
-            app.move_within_focused_panel(1);
-            was_focused != 2 || !app.selected_worktree().changed_files.is_empty()
-        }
+            _ => false,
+        },
+        MouseEventKind::ScrollDown => match panel_idx {
+            1 => {
+                let was_focused = app.focused_panel();
+                app.focus_panel_by_index(1);
+                app.focus_subpanel(-1);
+                app.scroll_chat_transcript(1);
+                was_focused != 1 || !app.chat_messages().is_empty()
+            }
+            2 => {
+                let was_focused = app.focused_panel();
+                app.focus_panel_by_index(2);
+                app.move_within_focused_panel(1);
+                was_focused != 2 || !app.selected_worktree().changed_files.is_empty()
+            }
+            _ => false,
+        },
         _ => false,
     }
 }
