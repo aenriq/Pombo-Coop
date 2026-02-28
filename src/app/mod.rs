@@ -1,18 +1,19 @@
 use std::{
     cell::Cell,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{BufRead, BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::{AppConfig, PanelFocusExpandMode};
+use crate::config::{AppConfig, PanelFocusExpandMode, config_path};
 use crate::provider::{AuthProbe, ProviderDescriptor, ProviderRegistry};
 use crate::theme::UiColors;
 
@@ -31,6 +32,9 @@ const THINKING_WAVE_WIDTH: usize = 8;
 const THINKING_WAVE_START_HOLD_TICKS: usize = 2;
 const THINKING_WAVE_LEVEL_GLYPHS: [char; 4] = ['⢀', '⠠', '⠐', '⠈'];
 const THINKING_WAVE_KERNEL: [u8; 8] = [0, 1, 2, 3, 3, 2, 1, 0];
+const CHAT_STORE_FILENAME: &str = "chats.json";
+const WORKTREE_STORE_FILENAME: &str = "worktrees.json";
+const DEFAULT_CHAT_READY_MESSAGE: &str = "Agent ready. Ask about the selected worktree.";
 const CODEX_MODEL_CATALOG: [(&str, &str); 5] = [
     ("gpt-5.3-codex", "Latest frontier agentic coding model."),
     ("gpt-5.2-codex", "Frontier agentic coding model."),
@@ -48,6 +52,7 @@ const CODEX_MODEL_CATALOG: [(&str, &str); 5] = [
 #[derive(Clone)]
 pub struct FileChange {
     pub path: &'static str,
+    pub pathspec: Option<String>,
     pub additions: u16,
     pub deletions: u16,
     pub kind: FileChangeKind,
@@ -88,6 +93,7 @@ pub struct Worktree {
     pub repo: &'static str,
     pub name: &'static str,
     pub branch: &'static str,
+    pub is_worktree: bool,
     pub status: &'static str,
     pub pr_number: u16,
     pub summary: &'static str,
@@ -122,16 +128,71 @@ pub struct ModelChoice {
 
 type ModelListFetchResult = Result<Vec<ModelChoice>, String>;
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct StoredChatSessions {
+    #[serde(default)]
+    sessions: BTreeMap<String, Vec<StoredChatMessage>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct StoredWorktrees {
+    #[serde(default)]
+    worktrees: Vec<StoredWorktree>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredWorktree {
+    repo: String,
+    name: String,
+    branch: String,
+    #[serde(default = "default_true")]
+    is_worktree: bool,
+    status: String,
+    pr_number: u16,
+    summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredChatMessage {
+    role: StoredChatRole,
+    content: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StoredChatRole {
+    Agent,
+    User,
+    System,
+}
+
 struct StreamingAgentMessage {
+    session_key: String,
     message_index: usize,
     full_message: String,
     revealed_chars: usize,
     total_chars: usize,
 }
 
+#[derive(Debug)]
+struct GitStatusEntry {
+    index_status: char,
+    worktree_status: char,
+    pathspec: String,
+    display_path: String,
+}
+
 pub struct App {
     worktrees: Vec<Worktree>,
+    chat_sessions: BTreeMap<String, Vec<ChatMessage>>,
     chat_messages: Vec<ChatMessage>,
+    persisted_worktrees: Vec<StoredWorktree>,
+    worktree_name_prompt: Option<String>,
+    agent_rename_prompt: Option<String>,
+    workspace_root: PathBuf,
+    workspace_repo_label: &'static str,
+    workspace_has_git_repo: bool,
+    builtin_worktree_count: usize,
     chat_draft: String,
     chat_cursor: usize,
     chat_preferred_column: Option<usize>,
@@ -152,6 +213,7 @@ pub struct App {
     config: AppConfig,
     chat_response_rx: Option<Receiver<ChatResponse>>,
     chat_request_in_flight: bool,
+    pending_request_session_key: Option<String>,
     streaming_agent_message: Option<StreamingAgentMessage>,
     thinking_wave_step: usize,
     model_picker_active: bool,
@@ -191,141 +253,178 @@ impl App {
             status_message = format!("Could not save config: {error}");
         }
 
+        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let workspace_repo_label_owned = workspace_root
+            .file_name()
+            .and_then(|part| part.to_str())
+            .map(str::to_owned)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| String::from("workspace"));
+        let workspace_repo_label = leak_owned_string(workspace_repo_label_owned);
+        let workspace_has_git_repo = detect_git_repository(&workspace_root);
+        let chat_sessions = load_chat_sessions_from_disk();
+        let persisted_worktrees = load_worktrees_from_disk();
+
+        let builtin_worktrees = vec![
+            Worktree {
+                repo: "conductor",
+                name: "Planner",
+                branch: "epic-b-shell",
+                is_worktree: false,
+                status: "In progress",
+                pr_number: 1,
+                summary: "Planning panel state + routing behavior.",
+                changed_files: vec![
+                    FileChange {
+                        path: "src/shell/planner.rs",
+                        pathspec: None,
+                        additions: 24,
+                        deletions: 9,
+                        kind: FileChangeKind::Modified,
+                        staged: false,
+                    },
+                    FileChange {
+                        path: "src/shell/events.rs",
+                        pathspec: None,
+                        additions: 6,
+                        deletions: 2,
+                        kind: FileChangeKind::Untracked,
+                        staged: false,
+                    },
+                    FileChange {
+                        path: "src/shell/new_pane.rs",
+                        pathspec: None,
+                        additions: 31,
+                        deletions: 0,
+                        kind: FileChangeKind::Added,
+                        staged: false,
+                    },
+                    FileChange {
+                        path: "src/shell/legacy_layout.rs",
+                        pathspec: None,
+                        additions: 0,
+                        deletions: 64,
+                        kind: FileChangeKind::Deleted,
+                        staged: false,
+                    },
+                    FileChange {
+                        path: "src/shell/tree_row.rs -> src/shell/worktree_row.rs",
+                        pathspec: None,
+                        additions: 14,
+                        deletions: 12,
+                        kind: FileChangeKind::Renamed,
+                        staged: true,
+                    },
+                    FileChange {
+                        path: "src/shell/worktree_row_copy.rs",
+                        pathspec: None,
+                        additions: 18,
+                        deletions: 0,
+                        kind: FileChangeKind::Copied,
+                        staged: false,
+                    },
+                    FileChange {
+                        path: "assets/icon.svg",
+                        pathspec: None,
+                        additions: 5,
+                        deletions: 3,
+                        kind: FileChangeKind::TypeChanged,
+                        staged: false,
+                    },
+                    FileChange {
+                        path: "src/shell/merge_state.rs",
+                        pathspec: None,
+                        additions: 42,
+                        deletions: 16,
+                        kind: FileChangeKind::Unmerged,
+                        staged: false,
+                    },
+                    FileChange {
+                        path: ".cache/build-index.json",
+                        pathspec: None,
+                        additions: 0,
+                        deletions: 0,
+                        kind: FileChangeKind::Ignored,
+                        staged: false,
+                    },
+                ],
+            },
+            Worktree {
+                repo: "conductor",
+                name: "Reviewer",
+                branch: "epic-b-diff",
+                is_worktree: false,
+                status: "Merge conflicts",
+                pr_number: 2,
+                summary: "Diff parsing and conflict summarization changes.",
+                changed_files: vec![
+                    FileChange {
+                        path: "src/diff/parser.rs",
+                        pathspec: None,
+                        additions: 98,
+                        deletions: 12,
+                        kind: FileChangeKind::Unmerged,
+                        staged: false,
+                    },
+                    FileChange {
+                        path: "src/diff/ui.rs",
+                        pathspec: None,
+                        additions: 53,
+                        deletions: 2,
+                        kind: FileChangeKind::Renamed,
+                        staged: false,
+                    },
+                    FileChange {
+                        path: "src/shell/right_panel.rs",
+                        pathspec: None,
+                        additions: 32,
+                        deletions: 0,
+                        kind: FileChangeKind::Added,
+                        staged: true,
+                    },
+                ],
+            },
+            Worktree {
+                repo: "melty_home",
+                name: "Regression Sweep",
+                branch: "epic-b-regression",
+                is_worktree: false,
+                status: "Needs changes",
+                pr_number: 4,
+                summary: "Catches keyboard edge cases in the composer.",
+                changed_files: vec![
+                    FileChange {
+                        path: "src/shell/textarea.rs",
+                        pathspec: None,
+                        additions: 0,
+                        deletions: 73,
+                        kind: FileChangeKind::Deleted,
+                        staged: false,
+                    },
+                    FileChange {
+                        path: "src/shell/diff_panel.rs",
+                        pathspec: None,
+                        additions: 8,
+                        deletions: 4,
+                        kind: FileChangeKind::Modified,
+                        staged: false,
+                    },
+                ],
+            },
+        ];
+        let builtin_worktree_count = builtin_worktrees.len();
+
         let mut app = Self {
-            worktrees: vec![
-                Worktree {
-                    repo: "conductor",
-                    name: "Planner",
-                    branch: "epic-b-shell",
-                    status: "In progress",
-                    pr_number: 1,
-                    summary: "Planning panel state + routing behavior.",
-                    changed_files: vec![
-                        FileChange {
-                            path: "src/shell/planner.rs",
-                            additions: 24,
-                            deletions: 9,
-                            kind: FileChangeKind::Modified,
-                            staged: false,
-                        },
-                        FileChange {
-                            path: "src/shell/events.rs",
-                            additions: 6,
-                            deletions: 2,
-                            kind: FileChangeKind::Untracked,
-                            staged: false,
-                        },
-                        FileChange {
-                            path: "src/shell/new_pane.rs",
-                            additions: 31,
-                            deletions: 0,
-                            kind: FileChangeKind::Added,
-                            staged: false,
-                        },
-                        FileChange {
-                            path: "src/shell/legacy_layout.rs",
-                            additions: 0,
-                            deletions: 64,
-                            kind: FileChangeKind::Deleted,
-                            staged: false,
-                        },
-                        FileChange {
-                            path: "src/shell/tree_row.rs -> src/shell/worktree_row.rs",
-                            additions: 14,
-                            deletions: 12,
-                            kind: FileChangeKind::Renamed,
-                            staged: true,
-                        },
-                        FileChange {
-                            path: "src/shell/worktree_row_copy.rs",
-                            additions: 18,
-                            deletions: 0,
-                            kind: FileChangeKind::Copied,
-                            staged: false,
-                        },
-                        FileChange {
-                            path: "assets/icon.svg",
-                            additions: 5,
-                            deletions: 3,
-                            kind: FileChangeKind::TypeChanged,
-                            staged: false,
-                        },
-                        FileChange {
-                            path: "src/shell/merge_state.rs",
-                            additions: 42,
-                            deletions: 16,
-                            kind: FileChangeKind::Unmerged,
-                            staged: false,
-                        },
-                        FileChange {
-                            path: ".cache/build-index.json",
-                            additions: 0,
-                            deletions: 0,
-                            kind: FileChangeKind::Ignored,
-                            staged: false,
-                        },
-                    ],
-                },
-                Worktree {
-                    repo: "conductor",
-                    name: "Reviewer",
-                    branch: "epic-b-diff",
-                    status: "Merge conflicts",
-                    pr_number: 2,
-                    summary: "Diff parsing and conflict summarization changes.",
-                    changed_files: vec![
-                        FileChange {
-                            path: "src/diff/parser.rs",
-                            additions: 98,
-                            deletions: 12,
-                            kind: FileChangeKind::Unmerged,
-                            staged: false,
-                        },
-                        FileChange {
-                            path: "src/diff/ui.rs",
-                            additions: 53,
-                            deletions: 2,
-                            kind: FileChangeKind::Renamed,
-                            staged: false,
-                        },
-                        FileChange {
-                            path: "src/shell/right_panel.rs",
-                            additions: 32,
-                            deletions: 0,
-                            kind: FileChangeKind::Added,
-                            staged: true,
-                        },
-                    ],
-                },
-                Worktree {
-                    repo: "melty_home",
-                    name: "Regression Sweep",
-                    branch: "epic-b-regression",
-                    status: "Needs changes",
-                    pr_number: 4,
-                    summary: "Catches keyboard edge cases in the composer.",
-                    changed_files: vec![
-                        FileChange {
-                            path: "src/shell/textarea.rs",
-                            additions: 0,
-                            deletions: 73,
-                            kind: FileChangeKind::Deleted,
-                            staged: false,
-                        },
-                        FileChange {
-                            path: "src/shell/diff_panel.rs",
-                            additions: 8,
-                            deletions: 4,
-                            kind: FileChangeKind::Modified,
-                            staged: false,
-                        },
-                    ],
-                },
-            ],
-            chat_messages: vec![ChatMessage {
-                role: ChatRole::System,
-                content: "Agent ready. Ask about the selected worktree.".to_owned(),
-            }],
+            worktrees: builtin_worktrees,
+            chat_sessions,
+            chat_messages: default_chat_messages(),
+            persisted_worktrees,
+            worktree_name_prompt: None,
+            agent_rename_prompt: None,
+            workspace_root,
+            workspace_repo_label,
+            workspace_has_git_repo,
+            builtin_worktree_count,
             chat_draft: String::new(),
             chat_cursor: 0,
             chat_preferred_column: None,
@@ -346,6 +445,7 @@ impl App {
             config,
             chat_response_rx: None,
             chat_request_in_flight: false,
+            pending_request_session_key: None,
             streaming_agent_message: None,
             thinking_wave_step: 0,
             model_picker_active: false,
@@ -360,6 +460,9 @@ impl App {
         if app.auth_required() {
             app.refresh_auth_from_local_cli(true);
         }
+
+        app.restore_persisted_worktrees();
+        app.sync_panel_state_for_selected_worktree();
 
         app
     }
@@ -684,6 +787,92 @@ impl App {
             .position(|idx| *idx == self.right_selected_idx)
             .unwrap_or(0);
         let target_indices = self.right_action_target_indices(&pre_order);
+        let post_action_selection = self.right_neighbor_selection_after_action(
+            &pre_order,
+            anchor_position,
+            &target_indices,
+        );
+
+        if self.selected_worktree().is_worktree {
+            if !self.workspace_has_git_repo {
+                self.status_message = String::from("No git repository found.");
+                return;
+            }
+
+            let mut moved = BTreeSet::new();
+            let mut staged_count = 0usize;
+            let mut unstaged_count = 0usize;
+            let mut only_path = String::new();
+            let mut errors = Vec::new();
+
+            for file_idx in target_indices {
+                let Some(file) = self
+                    .worktrees
+                    .get(self.selected_idx)
+                    .and_then(|worktree| worktree.changed_files.get(file_idx))
+                    .cloned()
+                else {
+                    continue;
+                };
+                let Some(pathspec) = file.pathspec.clone() else {
+                    errors.push(format!("Missing pathspec for '{}'.", file.path));
+                    continue;
+                };
+
+                let should_stage = !file.staged;
+                match apply_git_stage_update(&self.workspace_root, &pathspec, should_stage) {
+                    Ok(()) => {
+                        moved.insert(file_idx);
+                        if should_stage {
+                            staged_count += 1;
+                        } else {
+                            unstaged_count += 1;
+                        }
+                        if moved.len() == 1 {
+                            only_path = file.path.to_string();
+                        }
+                    }
+                    Err(error) => {
+                        errors.push(format!("{}: {}", file.path, error));
+                    }
+                }
+            }
+
+            if moved.is_empty() {
+                self.status_message = if errors.is_empty() {
+                    String::from("No files selected.")
+                } else {
+                    format!("Failed to update staging: {}", errors.join(" | "))
+                };
+                return;
+            }
+
+            self.refresh_selected_worktree_git_status();
+            self.select_right_file_by_signature(post_action_selection);
+            self.right_multi_selected.clear();
+            self.ensure_right_selection_valid();
+
+            if moved.len() == 1 {
+                if staged_count == 1 {
+                    self.status_message = format!("Staged '{}'.", only_path);
+                } else {
+                    self.status_message = format!("Unstaged '{}'.", only_path);
+                }
+            } else {
+                self.status_message = format!(
+                    "Updated {} files ({} staged, {} unstaged).",
+                    moved.len(),
+                    staged_count,
+                    unstaged_count
+                );
+            }
+
+            if !errors.is_empty() {
+                self.status_message
+                    .push_str(&format!(" Failed: {}", errors.join(" | ")));
+            }
+            return;
+        }
 
         let selected_idx = self.selected_idx;
         let mut moved = BTreeSet::new();
@@ -732,13 +921,375 @@ impl App {
             );
         }
 
-        self.advance_right_selection_after_action(&pre_order, anchor_position, &moved);
+        self.select_right_file_by_signature(post_action_selection);
         self.right_multi_selected.clear();
         self.ensure_right_selection_valid();
     }
 
     pub fn chat_messages(&self) -> &[ChatMessage] {
         &self.chat_messages
+    }
+
+    pub fn selected_worktree_has_git_repository(&self) -> bool {
+        if !self.selected_worktree().is_worktree {
+            // Mock/test worktrees are exempt from local git repository checks.
+            return true;
+        }
+
+        self.workspace_has_git_repo
+    }
+
+    pub fn selected_agent_can_rename(&self) -> bool {
+        self.selected_idx < self.worktrees.len() && !self.selected_worktree().is_worktree
+    }
+
+    fn active_chat_session_key(&self) -> Option<String> {
+        self.worktrees
+            .get(self.selected_idx)
+            .map(worktree_chat_session_key)
+    }
+
+    fn load_chat_session_for_selected_worktree(&mut self) {
+        let Some(session_key) = self.active_chat_session_key() else {
+            self.chat_messages = default_chat_messages();
+            return;
+        };
+
+        self.chat_messages = self
+            .chat_sessions
+            .get(&session_key)
+            .cloned()
+            .filter(|messages| !messages.is_empty())
+            .unwrap_or_else(default_chat_messages);
+    }
+
+    fn persist_active_chat_session(&mut self) {
+        let Some(session_key) = self.active_chat_session_key() else {
+            return;
+        };
+        self.chat_sessions
+            .insert(session_key, self.chat_messages.clone());
+        self.persist_chat_sessions();
+    }
+
+    fn append_message_to_session(&mut self, session_key: &str, message: ChatMessage) {
+        let is_active = self
+            .active_chat_session_key()
+            .is_some_and(|active| active == session_key);
+        let session = self
+            .chat_sessions
+            .entry(session_key.to_owned())
+            .or_insert_with(default_chat_messages);
+        session.push(message);
+        if is_active {
+            self.chat_messages = session.clone();
+        }
+        self.persist_chat_sessions();
+    }
+
+    fn persist_chat_sessions(&mut self) {
+        if let Err(error) = save_chat_sessions_to_disk(&self.chat_sessions) {
+            self.status_message = format!("Failed to save chats: {error}");
+        }
+    }
+
+    pub fn worktree_name_prompt_active(&self) -> bool {
+        self.worktree_name_prompt.is_some()
+    }
+
+    pub fn worktree_name_prompt_value(&self) -> &str {
+        self.worktree_name_prompt.as_deref().unwrap_or("")
+    }
+
+    pub fn agent_rename_prompt_active(&self) -> bool {
+        self.agent_rename_prompt.is_some()
+    }
+
+    pub fn agent_rename_prompt_value(&self) -> &str {
+        self.agent_rename_prompt.as_deref().unwrap_or("")
+    }
+
+    pub fn handle_worktree_name_prompt_key(&mut self, key: KeyEvent) -> bool {
+        if self.worktree_name_prompt.is_none() {
+            return false;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT)
+            || key.modifiers.contains(KeyModifiers::SUPER)
+        {
+            if matches!(key.code, KeyCode::Esc) {
+                self.worktree_name_prompt = None;
+                self.status_message = String::from("Canceled worktree creation.");
+                return true;
+            }
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.worktree_name_prompt = None;
+                self.status_message = String::from("Canceled worktree creation.");
+                true
+            }
+            KeyCode::Enter => {
+                let value = self
+                    .worktree_name_prompt
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                if value.is_empty() {
+                    self.status_message = String::from("Name the worktree before creating it.");
+                    return true;
+                }
+                self.worktree_name_prompt = None;
+                self.create_worktree_agent_entry(value);
+                true
+            }
+            KeyCode::Backspace => {
+                if let Some(prompt) = &mut self.worktree_name_prompt {
+                    prompt.pop();
+                }
+                true
+            }
+            KeyCode::Char(ch) => {
+                if let Some(prompt) = &mut self.worktree_name_prompt {
+                    prompt.push(ch);
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
+    pub fn handle_agent_rename_prompt_key(&mut self, key: KeyEvent) -> bool {
+        if self.agent_rename_prompt.is_none() {
+            return false;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT)
+            || key.modifiers.contains(KeyModifiers::SUPER)
+        {
+            if matches!(key.code, KeyCode::Esc) {
+                self.agent_rename_prompt = None;
+                self.status_message = String::from("Canceled agent rename.");
+                return true;
+            }
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.agent_rename_prompt = None;
+                self.status_message = String::from("Canceled agent rename.");
+                true
+            }
+            KeyCode::Enter => {
+                let value = self
+                    .agent_rename_prompt
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                if value.is_empty() {
+                    self.status_message = String::from("Name the agent before renaming it.");
+                    return true;
+                }
+                self.agent_rename_prompt = None;
+                self.rename_selected_non_worktree_agent(value);
+                true
+            }
+            KeyCode::Backspace => {
+                if let Some(prompt) = &mut self.agent_rename_prompt {
+                    prompt.pop();
+                }
+                true
+            }
+            KeyCode::Char(ch) => {
+                if let Some(prompt) = &mut self.agent_rename_prompt {
+                    prompt.push(ch);
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
+    pub fn handle_left_panel_shortcuts(&mut self, key: KeyEvent) -> bool {
+        if self.focused_panel != 0
+            || self.worktree_name_prompt.is_some()
+            || self.agent_rename_prompt.is_some()
+        {
+            return false;
+        }
+        if !key.modifiers.is_empty() {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                let auto_name = self.next_auto_worktree_name();
+                self.create_worktree_agent_entry(auto_name);
+                true
+            }
+            KeyCode::Char('w') | KeyCode::Char('W') => {
+                self.worktree_name_prompt = Some(String::new());
+                self.status_message =
+                    String::from("Name the new worktree and press Enter (Esc to cancel).");
+                true
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                if !self.selected_agent_can_rename() {
+                    self.status_message =
+                        String::from("Rename is only available for non-worktree agents.");
+                    return true;
+                }
+                self.agent_rename_prompt = Some(self.selected_worktree().name.to_owned());
+                self.status_message = String::from("Rename agent and press Enter (Esc to cancel).");
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn restore_persisted_worktrees(&mut self) {
+        for stored in &self.persisted_worktrees {
+            self.worktrees.push(stored.to_runtime());
+        }
+    }
+
+    fn create_worktree_agent_entry(&mut self, worktree_name: String) {
+        let agent_name = self.next_agent_name();
+        let pr_number = self.next_pr_number();
+        let summary = format!("Workspace: {}", self.workspace_root.display());
+        let stored = StoredWorktree {
+            repo: self.workspace_repo_label.to_owned(),
+            name: agent_name,
+            branch: worktree_name.clone(),
+            is_worktree: true,
+            status: String::from("Queued"),
+            pr_number,
+            summary,
+        };
+
+        self.worktrees.push(stored.to_runtime());
+        self.persisted_worktrees.push(stored.clone());
+        if let Err(error) = save_worktrees_to_disk(&self.persisted_worktrees) {
+            self.status_message = format!("Created worktree, but failed to persist it: {error}");
+        } else {
+            self.status_message = format!(
+                "Created agent '{}' for worktree '{}'.",
+                stored.name, worktree_name
+            );
+        }
+
+        let new_idx = self.worktrees.len().saturating_sub(1);
+        self.selected_idx = new_idx;
+        let chat_key = worktree_chat_session_key(self.selected_worktree());
+        self.chat_sessions
+            .entry(chat_key)
+            .or_insert_with(default_chat_messages);
+        self.persist_chat_sessions();
+        self.sync_panel_state_for_selected_worktree();
+    }
+
+    fn rename_selected_non_worktree_agent(&mut self, new_name: String) {
+        if !self.selected_agent_can_rename() {
+            self.status_message = String::from("Rename is only available for non-worktree agents.");
+            return;
+        }
+
+        let selected_idx = self.selected_idx;
+        let old_name = self.worktrees[selected_idx].name.to_owned();
+        if old_name == new_name {
+            self.status_message = format!("Agent name unchanged: '{new_name}'.");
+            return;
+        }
+
+        let duplicate = self
+            .worktrees
+            .iter()
+            .enumerate()
+            .any(|(idx, worktree)| idx != selected_idx && worktree.name == new_name);
+        if duplicate {
+            self.status_message = format!("An agent named '{new_name}' already exists.");
+            return;
+        }
+
+        let old_session_key = worktree_chat_session_key(&self.worktrees[selected_idx]);
+        self.worktrees[selected_idx].name = leak_owned_string(new_name.clone());
+        let new_session_key = worktree_chat_session_key(&self.worktrees[selected_idx]);
+
+        if selected_idx >= self.builtin_worktree_count {
+            let stored_idx = selected_idx - self.builtin_worktree_count;
+            if let Some(stored) = self.persisted_worktrees.get_mut(stored_idx) {
+                stored.name = new_name.clone();
+                if let Err(error) = save_worktrees_to_disk(&self.persisted_worktrees) {
+                    self.status_message = format!("Renamed in memory only: {error}");
+                }
+            }
+        }
+
+        if old_session_key != new_session_key {
+            if let Some(messages) = self.chat_sessions.remove(&old_session_key) {
+                self.chat_sessions.insert(new_session_key.clone(), messages);
+            }
+            if let Some(pending_session) = &self.pending_request_session_key {
+                if *pending_session == old_session_key {
+                    self.pending_request_session_key = Some(new_session_key.clone());
+                }
+            }
+            if let Some(streaming) = &mut self.streaming_agent_message {
+                if streaming.session_key == old_session_key {
+                    streaming.session_key = new_session_key;
+                }
+            }
+            self.persist_chat_sessions();
+        }
+
+        self.load_chat_session_for_selected_worktree();
+        self.status_message = format!("Renamed agent '{old_name}' to '{new_name}'.");
+    }
+
+    fn next_pr_number(&self) -> u16 {
+        self.worktrees
+            .iter()
+            .map(|worktree| worktree.pr_number)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
+    fn next_agent_name(&self) -> String {
+        let mut idx = 1usize;
+        loop {
+            let candidate = format!("Agent {idx}");
+            if !self
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.name == candidate)
+            {
+                return candidate;
+            }
+            idx = idx.saturating_add(1);
+        }
+    }
+
+    fn next_auto_worktree_name(&self) -> String {
+        let mut idx = 1usize;
+        loop {
+            let candidate = format!("worktree-{idx}");
+            if !self
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.branch.eq_ignore_ascii_case(&candidate))
+            {
+                return candidate;
+            }
+            idx = idx.saturating_add(1);
+        }
     }
 
     pub fn model_picker_active(&self) -> bool {
@@ -808,6 +1359,9 @@ impl App {
 
     pub fn thinking_wave(&self) -> Option<String> {
         if !self.chat_request_in_flight {
+            return None;
+        }
+        if !self.is_active_request_session() {
             return None;
         }
 
@@ -915,31 +1469,56 @@ impl App {
             match rx.try_recv() {
                 Ok(response) => {
                     self.chat_request_in_flight = false;
+                    self.pending_request_session_key = None;
                     self.thinking_wave_step = 0;
-                    self.chat_scroll = u16::MAX;
                     self.chat_subpanel = ChatSubpanel::Transcript;
+                    let is_active_session = self
+                        .active_chat_session_key()
+                        .is_some_and(|key| key == response.session_key);
                     if response.is_error {
                         self.streaming_agent_message = None;
-                        self.chat_messages.push(ChatMessage {
+                        let error_message = ChatMessage {
                             role: ChatRole::System,
                             content: response.message.clone(),
-                        });
-                        self.status_message = String::from("Agent request failed.");
+                        };
+                        if is_active_session {
+                            self.chat_scroll = u16::MAX;
+                            self.chat_messages.push(error_message);
+                            self.persist_active_chat_session();
+                            self.status_message = String::from("Agent request failed.");
+                        } else {
+                            self.append_message_to_session(&response.session_key, error_message);
+                            self.status_message =
+                                String::from("Agent request failed in another chat.");
+                        }
                     } else {
-                        let message_index = self.chat_messages.len();
-                        self.chat_messages.push(ChatMessage {
+                        let session = self
+                            .chat_sessions
+                            .entry(response.session_key.clone())
+                            .or_insert_with(default_chat_messages);
+                        let message_index = session.len();
+                        session.push(ChatMessage {
                             role: ChatRole::Agent,
                             content: String::new(),
                         });
+                        if is_active_session {
+                            self.chat_scroll = u16::MAX;
+                            self.chat_messages = session.clone();
+                        }
                         let total_chars = response.message.chars().count();
                         self.streaming_agent_message = Some(StreamingAgentMessage {
+                            session_key: response.session_key,
                             message_index,
                             full_message: response.message,
                             revealed_chars: 0,
                             total_chars,
                         });
                         self.advance_streaming_agent_message();
-                        self.status_message = String::from("Agent replied.");
+                        self.status_message = if is_active_session {
+                            String::from("Agent replied.")
+                        } else {
+                            String::from("Agent replied in another chat.")
+                        };
                     }
                     changed = true;
                 }
@@ -948,13 +1527,16 @@ impl App {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.chat_request_in_flight = false;
+                    self.pending_request_session_key = None;
                     self.streaming_agent_message = None;
                     self.thinking_wave_step = 0;
                     self.chat_subpanel = ChatSubpanel::Transcript;
+                    self.chat_scroll = u16::MAX;
                     self.chat_messages.push(ChatMessage {
                         role: ChatRole::System,
                         content: String::from("Agent process ended without returning a response."),
                     });
+                    self.persist_active_chat_session();
                     self.status_message = String::from("Agent request failed.");
                     changed = true;
                 }
@@ -975,6 +1557,7 @@ impl App {
                             content: format!("Connection test failed: {}", result.detail),
                         });
                         self.chat_scroll = u16::MAX;
+                        self.persist_active_chat_session();
                     }
                     changed = true;
                 }
@@ -1087,6 +1670,7 @@ impl App {
             self.selected_idx = 0;
             return;
         }
+        self.persist_active_chat_session();
         self.selected_idx = (self.selected_idx + 1) % self.worktrees.len();
         self.sync_panel_state_for_selected_worktree();
     }
@@ -1096,6 +1680,7 @@ impl App {
             self.selected_idx = 0;
             return;
         }
+        self.persist_active_chat_session();
         self.selected_idx = if self.selected_idx == 0 {
             self.worktrees.len() - 1
         } else {
@@ -1527,6 +2112,7 @@ impl App {
             role: ChatRole::User,
             content: message,
         });
+        self.persist_active_chat_session();
         self.chat_draft.clear();
         self.chat_cursor = 0;
         self.chat_preferred_column = None;
@@ -1697,14 +2283,48 @@ impl App {
         (unstaged, staged)
     }
 
+    fn refresh_selected_worktree_git_status(&mut self) {
+        if self.selected_idx >= self.worktrees.len() {
+            return;
+        }
+        if !self.worktrees[self.selected_idx].is_worktree {
+            return;
+        }
+
+        self.workspace_has_git_repo = detect_git_repository(&self.workspace_root);
+        if !self.workspace_has_git_repo {
+            if let Some(worktree) = self.worktrees.get_mut(self.selected_idx) {
+                worktree.changed_files.clear();
+            }
+            return;
+        }
+
+        match collect_git_file_changes(&self.workspace_root) {
+            Ok(changes) => {
+                if let Some(worktree) = self.worktrees.get_mut(self.selected_idx) {
+                    worktree.changed_files = changes;
+                }
+            }
+            Err(error) => {
+                self.status_message = format!("Failed to read git status: {error}");
+            }
+        }
+    }
+
     fn sync_panel_state_for_selected_worktree(&mut self) {
+        self.load_chat_session_for_selected_worktree();
         self.chat_scroll = 0;
         self.chat_subpanel = ChatSubpanel::Transcript;
         self.right_multi_selected.clear();
+        self.refresh_selected_worktree_git_status();
         self.ensure_right_selection_valid();
     }
 
     fn start_agent_response(&mut self) {
+        let Some(session_key) = self.active_chat_session_key() else {
+            self.status_message = String::from("No active chat session.");
+            return;
+        };
         let provider_id = self.active_provider_id().to_owned();
         let model = self.active_model_label().to_owned();
         let worktree = self.selected_worktree().clone();
@@ -1712,15 +2332,18 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.chat_response_rx = Some(rx);
         self.chat_request_in_flight = true;
+        self.pending_request_session_key = Some(session_key.clone());
         self.streaming_agent_message = None;
         self.thinking_wave_step = 0;
 
         std::thread::spawn(move || {
+            let timeout_session_key = session_key.clone();
             let response = run_with_timeout(CHAT_REQUEST_TIMEOUT, move || {
-                run_provider_chat(&provider_id, &model, &worktree, &chat_history)
+                run_provider_chat(&provider_id, &model, &worktree, &chat_history, &session_key)
             })
             .unwrap_or_else(|| ChatResponse {
                 is_error: true,
+                session_key: timeout_session_key,
                 message: format!(
                     "Agent request timed out after {}s. Check connectivity with Ctrl/Cmd+Y or F8.",
                     CHAT_REQUEST_TIMEOUT.as_secs()
@@ -1742,25 +2365,72 @@ impl App {
             .collect()
     }
 
-    fn advance_right_selection_after_action(
-        &mut self,
+    fn right_neighbor_selection_after_action(
+        &self,
         pre_order: &[usize],
         anchor_position: usize,
-        moved: &BTreeSet<usize>,
-    ) {
+        moved_indices: &[usize],
+    ) -> Option<(String, bool)> {
+        let moved = moved_indices.iter().copied().collect::<BTreeSet<_>>();
+
         for idx in pre_order.iter().skip(anchor_position + 1) {
             if !moved.contains(idx) {
-                self.right_selected_idx = *idx;
-                return;
+                let change = &self.selected_worktree().changed_files[*idx];
+                return Some((
+                    change
+                        .pathspec
+                        .clone()
+                        .unwrap_or_else(|| change.path.to_owned()),
+                    change.staged,
+                ));
             }
         }
 
         for idx in pre_order[..anchor_position].iter().rev() {
             if !moved.contains(idx) {
-                self.right_selected_idx = *idx;
-                return;
+                let change = &self.selected_worktree().changed_files[*idx];
+                return Some((
+                    change
+                        .pathspec
+                        .clone()
+                        .unwrap_or_else(|| change.path.to_owned()),
+                    change.staged,
+                ));
             }
         }
+
+        None
+    }
+
+    fn select_right_file_by_signature(&mut self, signature: Option<(String, bool)>) {
+        let Some((id, staged)) = signature else {
+            return;
+        };
+        if let Some((idx, _)) = self
+            .selected_worktree()
+            .changed_files
+            .iter()
+            .enumerate()
+            .find(|(_, change)| {
+                let change_id = change
+                    .pathspec
+                    .clone()
+                    .unwrap_or_else(|| change.path.to_owned());
+                change_id == id && change.staged == staged
+            })
+        {
+            self.right_selected_idx = idx;
+        }
+    }
+
+    fn is_active_request_session(&self) -> bool {
+        self.pending_request_session_key
+            .as_deref()
+            .is_some_and(|pending| {
+                self.active_chat_session_key()
+                    .as_deref()
+                    .is_some_and(|active| active == pending)
+            })
     }
 
     fn advance_streaming_agent_message(&mut self) -> bool {
@@ -1781,22 +2451,37 @@ impl App {
         let step = agent_stream_chars_per_tick(streaming.total_chars);
         let previous = streaming.revealed_chars;
         let next = previous.saturating_add(step).min(streaming.total_chars);
+        let session_key = streaming.session_key.clone();
+        let message_index = streaming.message_index;
 
         let start_byte = byte_index_for_char(&streaming.full_message, previous);
         let end_byte = byte_index_for_char(&streaming.full_message, next);
         let chunk = streaming.full_message[start_byte..end_byte].to_string();
+        streaming.revealed_chars = next;
+        let stream_finished = streaming.revealed_chars >= streaming.total_chars;
 
-        if let Some(message) = self.chat_messages.get_mut(streaming.message_index) {
+        let is_active_session = self
+            .active_chat_session_key()
+            .is_some_and(|key| key == session_key);
+        let session = self
+            .chat_sessions
+            .entry(session_key)
+            .or_insert_with(default_chat_messages);
+        if let Some(message) = session.get_mut(message_index) {
             message.content.push_str(&chunk);
         } else {
             self.streaming_agent_message = None;
             return false;
         }
 
-        streaming.revealed_chars = next;
-        self.chat_scroll = u16::MAX;
-        if streaming.revealed_chars >= streaming.total_chars {
+        if is_active_session {
+            self.chat_messages = session.clone();
+            self.chat_scroll = u16::MAX;
+        }
+
+        if stream_finished {
             self.streaming_agent_message = None;
+            self.persist_chat_sessions();
         }
         true
     }
@@ -1825,6 +2510,460 @@ fn open_external_url(url: &str) -> std::io::Result<()> {
     Err(std::io::Error::other(
         "opening URLs is not supported on this platform",
     ))
+}
+
+fn worktree_chat_session_key(worktree: &Worktree) -> String {
+    format!("{}::{}::{}", worktree.repo, worktree.name, worktree.branch)
+}
+
+fn default_chat_messages() -> Vec<ChatMessage> {
+    vec![ChatMessage {
+        role: ChatRole::System,
+        content: DEFAULT_CHAT_READY_MESSAGE.to_owned(),
+    }]
+}
+
+fn chat_store_path() -> PathBuf {
+    let config = config_path();
+    if let Some(parent) = config.parent() {
+        return parent.join(CHAT_STORE_FILENAME);
+    }
+    PathBuf::from(".agent-manager").join(CHAT_STORE_FILENAME)
+}
+
+fn load_chat_sessions_from_disk() -> BTreeMap<String, Vec<ChatMessage>> {
+    let path = chat_store_path();
+    let Ok(raw) = fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    let Ok(stored) = serde_json::from_str::<StoredChatSessions>(&raw) else {
+        return BTreeMap::new();
+    };
+
+    stored
+        .sessions
+        .into_iter()
+        .map(|(session_key, messages)| {
+            let restored = messages
+                .into_iter()
+                .map(|message| ChatMessage {
+                    role: match message.role {
+                        StoredChatRole::Agent => ChatRole::Agent,
+                        StoredChatRole::User => ChatRole::User,
+                        StoredChatRole::System => ChatRole::System,
+                    },
+                    content: message.content,
+                })
+                .collect::<Vec<_>>();
+            (session_key, restored)
+        })
+        .collect()
+}
+
+fn save_chat_sessions_to_disk(
+    sessions: &BTreeMap<String, Vec<ChatMessage>>,
+) -> std::io::Result<()> {
+    let path = chat_store_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let stored = StoredChatSessions {
+        sessions: sessions
+            .iter()
+            .map(|(session_key, messages)| {
+                let serialized = messages
+                    .iter()
+                    .map(|message| StoredChatMessage {
+                        role: match message.role {
+                            ChatRole::Agent => StoredChatRole::Agent,
+                            ChatRole::User => StoredChatRole::User,
+                            ChatRole::System => StoredChatRole::System,
+                        },
+                        content: message.content.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                (session_key.clone(), serialized)
+            })
+            .collect(),
+    };
+
+    let raw = serde_json::to_string_pretty(&stored)
+        .map_err(|error| std::io::Error::other(format!("serialize chats: {error}")))?;
+    fs::write(path, raw)
+}
+
+impl StoredWorktree {
+    fn to_runtime(&self) -> Worktree {
+        Worktree {
+            repo: leak_owned_string(self.repo.clone()),
+            name: leak_owned_string(self.name.clone()),
+            branch: leak_owned_string(self.branch.clone()),
+            is_worktree: self.is_worktree,
+            status: leak_owned_string(self.status.clone()),
+            pr_number: self.pr_number,
+            summary: leak_owned_string(self.summary.clone()),
+            changed_files: Vec::new(),
+        }
+    }
+}
+
+fn worktree_store_path() -> PathBuf {
+    let config = config_path();
+    if let Some(parent) = config.parent() {
+        return parent.join(WORKTREE_STORE_FILENAME);
+    }
+    PathBuf::from(".agent-manager").join(WORKTREE_STORE_FILENAME)
+}
+
+fn load_worktrees_from_disk() -> Vec<StoredWorktree> {
+    let path = worktree_store_path();
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(stored) = serde_json::from_str::<StoredWorktrees>(&raw) else {
+        return Vec::new();
+    };
+    stored.worktrees
+}
+
+fn save_worktrees_to_disk(worktrees: &[StoredWorktree]) -> std::io::Result<()> {
+    let path = worktree_store_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let stored = StoredWorktrees {
+        worktrees: worktrees.to_vec(),
+    };
+    let raw = serde_json::to_string_pretty(&stored)
+        .map_err(|error| std::io::Error::other(format!("serialize worktrees: {error}")))?;
+    fs::write(path, raw)
+}
+
+fn leak_owned_string(value: String) -> &'static str {
+    Box::leak(value.into_boxed_str())
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn detect_git_repository(path: &Path) -> bool {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output();
+
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+
+    std::str::from_utf8(&output.stdout)
+        .map(|value| value.trim() == "true")
+        .unwrap_or(false)
+}
+
+fn apply_git_stage_update(repo_root: &Path, pathspec: &str, stage: bool) -> Result<(), String> {
+    if stage {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["add", "--", pathspec])
+            .output()
+            .map_err(|error| format!("failed to run git add: {error}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        return Err(git_command_error_detail(
+            "git add failed",
+            &output.stderr,
+            &output.stdout,
+        ));
+    }
+
+    let restore_output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["restore", "--staged", "--", pathspec])
+        .output()
+        .map_err(|error| format!("failed to run git restore --staged: {error}"))?;
+    if restore_output.status.success() {
+        return Ok(());
+    }
+
+    // Fallback for older git versions where restore may not exist.
+    let reset_output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["reset", "HEAD", "--", pathspec])
+        .output()
+        .map_err(|error| format!("failed to run git reset HEAD: {error}"))?;
+    if reset_output.status.success() {
+        return Ok(());
+    }
+
+    Err(git_command_error_detail(
+        "git unstage failed",
+        &reset_output.stderr,
+        &reset_output.stdout,
+    ))
+}
+
+fn collect_git_file_changes(repo_root: &Path) -> Result<Vec<FileChange>, String> {
+    let status_output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .map_err(|error| format!("failed to run git status: {error}"))?;
+    if !status_output.status.success() {
+        return Err(git_command_error_detail(
+            "git status failed",
+            &status_output.stderr,
+            &status_output.stdout,
+        ));
+    }
+
+    let staged_numstat = git_numstat_map(repo_root, true)?;
+    let unstaged_numstat = git_numstat_map(repo_root, false)?;
+    let entries = parse_git_status_porcelain_z(&status_output.stdout)?;
+
+    let mut changes = Vec::new();
+    for entry in entries {
+        let is_unmerged = is_unmerged_git_status(entry.index_status, entry.worktree_status);
+        let file_id = entry.pathspec.clone();
+        let display_path = leak_owned_string(entry.display_path);
+
+        if is_unmerged {
+            let (additions, deletions) = git_numstat_counts_for(&unstaged_numstat, &file_id);
+            changes.push(FileChange {
+                path: display_path,
+                pathspec: Some(file_id),
+                additions,
+                deletions,
+                kind: FileChangeKind::Unmerged,
+                staged: false,
+            });
+            continue;
+        }
+
+        if entry.index_status == '?' && entry.worktree_status == '?' {
+            changes.push(FileChange {
+                path: display_path,
+                pathspec: Some(file_id),
+                additions: 0,
+                deletions: 0,
+                kind: FileChangeKind::Untracked,
+                staged: false,
+            });
+            continue;
+        }
+
+        if entry.index_status == '!' && entry.worktree_status == '!' {
+            changes.push(FileChange {
+                path: display_path,
+                pathspec: Some(file_id),
+                additions: 0,
+                deletions: 0,
+                kind: FileChangeKind::Ignored,
+                staged: false,
+            });
+            continue;
+        }
+
+        if !matches!(entry.index_status, ' ' | '?' | '!') {
+            let (additions, deletions) = git_numstat_counts_for(&staged_numstat, &entry.pathspec);
+            changes.push(FileChange {
+                path: display_path,
+                pathspec: Some(entry.pathspec.clone()),
+                additions,
+                deletions,
+                kind: git_status_char_kind(entry.index_status),
+                staged: true,
+            });
+        }
+
+        if !matches!(entry.worktree_status, ' ') {
+            let (additions, deletions) = git_numstat_counts_for(&unstaged_numstat, &entry.pathspec);
+            changes.push(FileChange {
+                path: display_path,
+                pathspec: Some(entry.pathspec),
+                additions,
+                deletions,
+                kind: git_status_char_kind(entry.worktree_status),
+                staged: false,
+            });
+        }
+    }
+
+    Ok(changes)
+}
+
+fn parse_git_status_porcelain_z(raw: &[u8]) -> Result<Vec<GitStatusEntry>, String> {
+    let mut entries = Vec::new();
+    let mut cursor = 0usize;
+
+    while cursor < raw.len() {
+        if cursor + 3 > raw.len() {
+            return Err(String::from("git status output ended unexpectedly."));
+        }
+        let index_status = raw[cursor] as char;
+        let worktree_status = raw[cursor + 1] as char;
+        if raw[cursor + 2] != b' ' {
+            return Err(String::from(
+                "git status output had an unexpected field separator.",
+            ));
+        }
+        cursor += 3;
+
+        let (first_path, next_cursor) = read_git_status_field(raw, cursor)?;
+        cursor = next_cursor;
+
+        let (pathspec, display_path) = if matches!(index_status, 'R' | 'C') {
+            let (second_path, next_cursor) = read_git_status_field(raw, cursor)?;
+            cursor = next_cursor;
+            (
+                second_path.clone(),
+                format!("{first_path} -> {second_path}"),
+            )
+        } else {
+            (first_path.clone(), first_path)
+        };
+
+        entries.push(GitStatusEntry {
+            index_status,
+            worktree_status,
+            pathspec,
+            display_path,
+        });
+    }
+
+    Ok(entries)
+}
+
+fn read_git_status_field(raw: &[u8], start: usize) -> Result<(String, usize), String> {
+    let relative_end = raw[start..]
+        .iter()
+        .position(|byte| *byte == b'\0')
+        .ok_or_else(|| String::from("git status path entry was missing a NUL terminator"))?;
+    let end = start + relative_end;
+    let value = String::from_utf8_lossy(&raw[start..end]).into_owned();
+    Ok((value, end + 1))
+}
+
+fn git_status_char_kind(status: char) -> FileChangeKind {
+    match status {
+        'A' => FileChangeKind::Added,
+        'D' => FileChangeKind::Deleted,
+        'R' => FileChangeKind::Renamed,
+        'C' => FileChangeKind::Copied,
+        'T' => FileChangeKind::TypeChanged,
+        'U' => FileChangeKind::Unmerged,
+        '?' => FileChangeKind::Untracked,
+        '!' => FileChangeKind::Ignored,
+        _ => FileChangeKind::Modified,
+    }
+}
+
+fn is_unmerged_git_status(index_status: char, worktree_status: char) -> bool {
+    matches!(
+        (index_status, worktree_status),
+        ('U', _) | (_, 'U') | ('A', 'A') | ('D', 'D')
+    )
+}
+
+fn git_numstat_map(repo_root: &Path, staged: bool) -> Result<BTreeMap<String, (u16, u16)>, String> {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(repo_root)
+        .arg("diff")
+        .arg("--numstat");
+    if staged {
+        command.arg("--cached");
+    }
+
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to run git diff --numstat: {error}"))?;
+    if !output.status.success() {
+        return Err(git_command_error_detail(
+            "git diff --numstat failed",
+            &output.stderr,
+            &output.stdout,
+        ));
+    }
+
+    let mut map = BTreeMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.splitn(3, '\t');
+        let additions = fields.next().and_then(parse_numstat_value).unwrap_or(0);
+        let deletions = fields.next().and_then(parse_numstat_value).unwrap_or(0);
+        let Some(path) = fields.next().map(str::trim) else {
+            continue;
+        };
+        let normalized = normalize_git_numstat_path(path);
+
+        let entry = map.entry(normalized).or_insert((0u16, 0u16));
+        entry.0 = entry.0.saturating_add(additions);
+        entry.1 = entry.1.saturating_add(deletions);
+    }
+
+    Ok(map)
+}
+
+fn git_numstat_counts_for(numstat: &BTreeMap<String, (u16, u16)>, pathspec: &str) -> (u16, u16) {
+    if let Some(value) = numstat.get(pathspec) {
+        return *value;
+    }
+
+    let normalized = normalize_git_numstat_path(pathspec);
+    numstat.get(&normalized).copied().unwrap_or((0, 0))
+}
+
+fn parse_numstat_value(raw: &str) -> Option<u16> {
+    if raw.trim() == "-" {
+        return Some(0);
+    }
+    raw.trim().parse::<u16>().ok()
+}
+
+fn normalize_git_numstat_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if let (Some(open), Some(close)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if open < close {
+            let prefix = &trimmed[..open];
+            let inside = &trimmed[open + 1..close];
+            let suffix = &trimmed[close + 1..];
+            if let Some((_, rhs)) = inside.split_once("=>") {
+                return format!("{prefix}{}{suffix}", rhs.trim());
+            }
+        }
+    }
+
+    if let Some((_, rhs)) = trimmed.rsplit_once(" => ") {
+        return rhs.trim().to_string();
+    }
+
+    trimmed.to_string()
+}
+
+fn git_command_error_detail(prefix: &str, stderr: &[u8], stdout: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
+
+    if !stderr.is_empty() {
+        format!("{prefix}: {stderr}")
+    } else if !stdout.is_empty() {
+        format!("{prefix}: {stdout}")
+    } else {
+        prefix.to_owned()
+    }
 }
 
 fn panel_ratios_from_widths(widths: [u16; PANEL_COUNT]) -> [f32; PANEL_COUNT] {
@@ -1966,6 +3105,7 @@ fn build_fallback_model_choices(provider_id: &str, current_model: &str) -> Vec<M
 
 #[derive(Debug)]
 struct ChatResponse {
+    session_key: String,
     message: String,
     is_error: bool,
 }
@@ -1975,10 +3115,12 @@ fn run_provider_chat(
     model: &str,
     worktree: &Worktree,
     chat_history: &[ChatMessage],
+    session_key: &str,
 ) -> ChatResponse {
     match provider_id {
-        "codex" => run_codex_chat(model, worktree, chat_history),
+        "codex" => run_codex_chat(model, worktree, chat_history, session_key),
         other => ChatResponse {
+            session_key: session_key.to_owned(),
             is_error: true,
             message: format!("Provider '{other}' does not support chat yet."),
         },
@@ -2268,14 +3410,21 @@ fn is_non_fatal_codex_warning(line: &str) -> bool {
     line.contains("could not update PATH")
 }
 
-fn run_codex_chat(model: &str, worktree: &Worktree, chat_history: &[ChatMessage]) -> ChatResponse {
+fn run_codex_chat(
+    model: &str,
+    worktree: &Worktree,
+    chat_history: &[ChatMessage],
+    session_key: &str,
+) -> ChatResponse {
     let prompt = build_codex_chat_prompt(worktree, chat_history);
     match run_codex_exec_last_message(model, &prompt) {
         Ok(message) => ChatResponse {
+            session_key: session_key.to_owned(),
             message,
             is_error: false,
         },
         Err(message) => ChatResponse {
+            session_key: session_key.to_owned(),
             is_error: true,
             message,
         },
@@ -2921,8 +4070,9 @@ fn glob_pattern_match_recursive(
 mod tests {
     use super::{
         extract_assistant_message_from_codex_stdout, extract_codex_failure_detail,
-        normalize_model_choices, parse_codex_model_list_choices, render_thinking_wave,
-        summarize_structured_api_error, thinking_wave_cycle_len,
+        normalize_git_numstat_path, normalize_model_choices, parse_codex_model_list_choices,
+        parse_git_status_porcelain_z, render_thinking_wave, summarize_structured_api_error,
+        thinking_wave_cycle_len,
     };
     use serde_json::json;
 
@@ -3101,5 +4251,27 @@ OpenAI Codex v0.104.0
 
         assert_eq!(choices[0].id, "custom-model");
         assert!(choices[0].is_current);
+    }
+
+    #[test]
+    fn parses_porcelain_v1_z_status_entries() {
+        let raw = b"M  src/main.rs\0R  src/old.rs\0src/new.rs\0?? README.md\0";
+        let entries = parse_git_status_porcelain_z(raw).expect("expected parsed status");
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].index_status, 'M');
+        assert_eq!(entries[0].worktree_status, ' ');
+        assert_eq!(entries[0].pathspec, "src/main.rs");
+        assert_eq!(entries[1].index_status, 'R');
+        assert_eq!(entries[1].pathspec, "src/new.rs");
+        assert_eq!(entries[1].display_path, "src/old.rs -> src/new.rs");
+        assert_eq!(entries[2].index_status, '?');
+        assert_eq!(entries[2].worktree_status, '?');
+    }
+
+    #[test]
+    fn normalizes_numstat_brace_rename_paths() {
+        let normalized = normalize_git_numstat_path("src/{old => new}/file.rs");
+        assert_eq!(normalized, "src/new/file.rs");
     }
 }

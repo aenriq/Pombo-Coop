@@ -39,6 +39,7 @@ pub fn render_right_panel(frame: &mut Frame, app: &App, area: Rect, focused: boo
 
 struct WorktreesPane {
     chrome: PaneChrome,
+    focused: bool,
     colors: UiColors,
 }
 
@@ -46,11 +47,32 @@ impl WorktreesPane {
     fn new(focused: bool, colors: UiColors) -> Self {
         Self {
             chrome: pane_chrome(focused, colors),
+            focused,
             colors,
         }
     }
 
     fn draw(self, frame: &mut Frame, app: &App, area: Rect) {
+        let panel_block =
+            base_panel_block(Borders::ALL, self.chrome, self.colors).title("Worktrees");
+        let panel_inner = panel_block.inner(area);
+        frame.render_widget(panel_block, area);
+
+        if panel_inner.width == 0 || panel_inner.height == 0 {
+            return;
+        }
+
+        let footer_height = if panel_inner.height > 2 { 2 } else { 0 };
+        let (list_area, footer_area) = if footer_height > 0 {
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(footer_height)])
+                .split(panel_inner);
+            (split[0], Some(split[1]))
+        } else {
+            (panel_inner, None)
+        };
+
         let list_items = app
             .worktrees()
             .iter()
@@ -72,7 +94,6 @@ impl WorktreesPane {
 
         let list = List::new(list_items)
             .style(panel_surface_style(self.colors))
-            .block(base_panel_block(Borders::ALL, self.chrome, self.colors).title("Worktrees"))
             .highlight_style(
                 Style::default()
                     .bg(self.colors.list_highlight_background)
@@ -83,8 +104,212 @@ impl WorktreesPane {
 
         let mut state = ListState::default();
         state.select(Some(app.selected_worktree_idx()));
-        frame.render_stateful_widget(list, area, &mut state);
+        frame.render_stateful_widget(list, list_area, &mut state);
+        render_worktrees_footer(
+            frame,
+            footer_area,
+            self.focused,
+            app.worktree_name_prompt_active(),
+            app.agent_rename_prompt_active(),
+            app.selected_agent_can_rename(),
+            self.colors,
+        );
+
+        if app.worktree_name_prompt_active() {
+            render_worktree_name_overlay(frame, app, area, self.colors);
+        }
+        if app.agent_rename_prompt_active() {
+            render_agent_rename_overlay(frame, app, area, self.colors);
+        }
     }
+}
+
+fn render_worktrees_footer(
+    frame: &mut Frame,
+    area: Option<Rect>,
+    focused: bool,
+    worktree_prompt_active: bool,
+    rename_prompt_active: bool,
+    can_rename_selected: bool,
+    colors: UiColors,
+) {
+    let Some(area) = area else {
+        return;
+    };
+
+    let footer_block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(if focused {
+            colors.border_focused
+        } else {
+            colors.border_default
+        }))
+        .style(panel_surface_style(colors));
+    let footer_inner = footer_block.inner(area);
+    frame.render_widget(footer_block, area);
+
+    if footer_inner.width == 0 || footer_inner.height == 0 {
+        return;
+    }
+
+    let hotkey_style = Style::default()
+        .fg(colors.panel_foreground)
+        .add_modifier(Modifier::BOLD);
+    let text_style = Style::default().fg(colors.muted_text);
+    let line = if worktree_prompt_active || rename_prompt_active {
+        let action = if rename_prompt_active {
+            " rename"
+        } else {
+            " create"
+        };
+        Line::from(vec![
+            Span::styled("Enter", hotkey_style),
+            Span::styled(action, text_style),
+            Span::styled("  ", text_style),
+            Span::styled("Esc", hotkey_style),
+            Span::styled(" cancel", text_style),
+        ])
+    } else {
+        let mut spans = vec![
+            Span::styled("A", hotkey_style),
+            Span::styled(" new agent  ", text_style),
+            Span::styled("W", hotkey_style),
+            Span::styled(" new worktree", text_style),
+        ];
+        if can_rename_selected {
+            spans.extend([
+                Span::styled("  ", text_style),
+                Span::styled("R", hotkey_style),
+                Span::styled(" rename agent", text_style),
+            ]);
+        }
+        Line::from(spans)
+    };
+
+    frame.render_widget(
+        Paragraph::new(line)
+            .style(panel_surface_style(colors))
+            .wrap(Wrap { trim: false }),
+        footer_inner,
+    );
+}
+
+fn render_worktree_name_overlay(frame: &mut Frame, app: &App, area: Rect, colors: UiColors) {
+    if area.width < 24 || area.height < 8 {
+        return;
+    }
+
+    let popup_width = area.width.saturating_sub(4).min(52);
+    let popup_height = 7;
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(popup_width)) / 2,
+        y: area.y + (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height.min(area.height.saturating_sub(1)),
+    };
+
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title("New Worktree")
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(colors.border_focused)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(panel_surface_style(colors));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let prompt = app.worktree_name_prompt_value();
+    let lines = vec![
+        Line::from(Span::styled(
+            "Type worktree name. Agent name is auto-generated.",
+            Style::default().fg(colors.muted_text),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Name: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                if prompt.is_empty() { " " } else { prompt },
+                Style::default().fg(colors.panel_foreground),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "Enter to create • Esc to cancel",
+            Style::default().fg(colors.muted_text),
+        )),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(panel_surface_style(colors))
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+fn render_agent_rename_overlay(frame: &mut Frame, app: &App, area: Rect, colors: UiColors) {
+    if area.width < 24 || area.height < 8 {
+        return;
+    }
+
+    let popup_width = area.width.saturating_sub(4).min(52);
+    let popup_height = 7;
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(popup_width)) / 2,
+        y: area.y + (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height.min(area.height.saturating_sub(1)),
+    };
+
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title("Rename Agent")
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(colors.border_focused)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(panel_surface_style(colors));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let prompt = app.agent_rename_prompt_value();
+    let lines = vec![
+        Line::from(Span::styled(
+            "Rename selected non-worktree agent.",
+            Style::default().fg(colors.muted_text),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Name: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                if prompt.is_empty() { " " } else { prompt },
+                Style::default().fg(colors.panel_foreground),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "Enter to rename • Esc to cancel",
+            Style::default().fg(colors.muted_text),
+        )),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(panel_surface_style(colors))
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 struct ChatPane {
@@ -321,8 +546,8 @@ fn wrapped_rows_for_line(line: &Line<'_>, wrap_width: usize) -> usize {
             saw_symbol = true;
             let is_whitespace = ch.is_whitespace();
             let word_found = non_whitespace_previous && is_whitespace;
-            let untrimmed_overflow = line_width == 0
-                && word_width + whitespace_width + symbol_width > wrap_width;
+            let untrimmed_overflow =
+                line_width == 0 && word_width + whitespace_width + symbol_width > wrap_width;
 
             if word_found || untrimmed_overflow {
                 line_width += whitespace_width;
@@ -625,7 +850,12 @@ impl ChangedFilesPane {
         };
 
         if selected.changed_files.is_empty() {
-            let panel = Paragraph::new("No changed files.")
+            let empty_message = if app.selected_worktree_has_git_repository() {
+                "No changed files."
+            } else {
+                "No git repository found."
+            };
+            let panel = Paragraph::new(empty_message)
                 .style(panel_surface_style(self.colors))
                 .wrap(Wrap { trim: false });
             frame.render_widget(panel, list_area);

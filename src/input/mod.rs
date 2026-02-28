@@ -13,6 +13,14 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    if app.handle_agent_rename_prompt_key(key) {
+        return;
+    }
+
+    if app.handle_worktree_name_prompt_key(key) {
+        return;
+    }
+
     if is_connection_test_shortcut(&key) {
         app.run_connection_test();
         return;
@@ -31,6 +39,10 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) {
     }
 
     if app.handle_right_search_key(key) {
+        return;
+    }
+
+    if app.handle_left_panel_shortcuts(key) {
         return;
     }
 
